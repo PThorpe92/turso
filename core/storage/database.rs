@@ -44,7 +44,6 @@ impl Default for IOContext {
 /// or something like a remote page server service.
 pub trait DatabaseStorage: Send + Sync {
     fn read_header(&self, c: Completion) -> Result<Completion>;
-
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion>;
     fn write_page(
         &self,
@@ -58,6 +57,13 @@ pub trait DatabaseStorage: Send + Sync {
         first_page_idx: usize,
         page_size: usize,
         buffers: Vec<Arc<Buffer>>,
+        io_ctx: &IOContext,
+        c: Completion,
+    ) -> Result<Completion>;
+    fn fetch_block(
+        &self,
+        first_page_id: usize,
+        page_size: usize,
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion>;
@@ -132,6 +138,86 @@ impl DatabaseStorage for DatabaseFile {
         } else {
             self.file.pread(pos, c)
         }
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn fetch_block(
+        &self,
+        start: usize,
+        page_size: usize,
+        io_ctx: &IOContext,
+        c: Completion,
+    ) -> Result<Completion> {
+        if !(512..=65536).contains(&page_size) || page_size & (page_size - 1) != 0 {
+            return Err(LimboError::NotADB);
+        }
+        let total_len = c.as_read().buf().len();
+        if total_len == 0 || total_len % page_size != 0 {
+            return Err(LimboError::InvalidArgument(format!(
+                "fetch_block buffer len {} must be a positive multiple of page_size {}",
+                total_len, page_size
+            )));
+        }
+        let expected_pages = total_len / page_size;
+
+        let pos = (start - 1) * page_size;
+
+        if let Some(ctx) = io_ctx.encryption_context() {
+            let encryption_ctx = ctx.clone();
+            let read_buf_arc = c.as_read().buf_arc();
+            let original_c = c.clone();
+
+            let decrypt_complete =
+                Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    let Ok((cipher_block, bytes_read)) = res else {
+                        return;
+                    };
+                    // Require full block, prefetch is 'best-effort', but partial data breaks page framing
+                    if bytes_read as usize != cipher_block.len() {
+                        if !original_c.has_error() {
+                            original_c
+                                .error(CompletionError::IOError(std::io::ErrorKind::InvalidData));
+                        }
+                        return;
+                    }
+                    // decrypt page-by-page into the caller's buffer
+                    let dst = original_c.as_read().buf();
+                    let block_bytes = cipher_block.as_slice();
+                    for i in 0..expected_pages {
+                        let off = i * page_size;
+                        let end = off + page_size;
+                        let page_id = (start as usize) + i;
+                        match encryption_ctx.decrypt_page(&block_bytes[off..end], page_id) {
+                            Ok(plain) => {
+                                crate::turso_assert!(
+                                    plain.len().eq(&page_size),
+                                    "page size mismatch after decryption"
+                                );
+                                dst.as_mut_slice()[off..end].copy_from_slice(&plain);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to decrypt page data for page_id={page_id}: {e}"
+                                );
+                                if !original_c.has_error() {
+                                    original_c.error(CompletionError::DecryptionError {
+                                        page_idx: page_id,
+                                    });
+                                }
+                                return;
+                            }
+                        }
+                    }
+
+                    original_c.complete(bytes_read);
+                });
+
+            let new_c = Completion::new_read(read_buf_arc, decrypt_complete);
+            return self.file.pread(pos as usize, new_c);
+        }
+
+        // straight read
+        self.file.pread(pos as usize, c)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

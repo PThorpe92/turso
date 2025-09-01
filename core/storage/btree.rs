@@ -1242,10 +1242,18 @@ impl BTreeCursor {
                     (Some(right_most_pointer), false) => {
                         // do rightmost
                         self.stack.advance();
+                        let mut ios = vec![];
+                        let next = right_most_pointer as usize;
+                        if let Some(prev) = self.pager.last_io_page() {
+                            if let Some(c) = self.pager.maybe_prefetch_after(prev, next) {
+                                ios.push(c);
+                            }
+                        }
                         let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            ios.push(c);
+                            io_yield_many!(ios);
                         }
                         continue;
                     }
@@ -1282,11 +1290,19 @@ impl BTreeCursor {
                 return Ok(IOResult::Done(true));
             }
 
+            let mut ios = vec![];
             let left_child_page = contents.cell_interior_read_left_child_page(cell_idx);
+            let next = left_child_page as usize;
+            if let Some(prev) = self.pager.last_io_page() {
+                if let Some(c) = self.pager.maybe_prefetch_after(prev, next) {
+                    ios.push(c);
+                }
+            }
             let (mem_page, c) = self.read_page(left_child_page as usize)?;
             self.stack.push(mem_page);
             if let Some(c) = c {
-                io_yield_one!(c);
+                ios.push(c);
+                io_yield_many!(ios);
             }
         }
     }
@@ -1360,10 +1376,20 @@ impl BTreeCursor {
                     match contents.rightmost_pointer() {
                         Some(right_most_pointer) => {
                             self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                            let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
+                            let next = right_most_pointer as usize;
+                            let mut ios = vec![];
+                            if let Some(prev) = self.pager.last_io_page() {
+                                if let Some(c) = self.pager.maybe_prefetch_after(prev, next) {
+                                    ios.push(c);
+                                }
+                            }
+                            let (mem_page, c) = self.read_page(next)?;
                             self.stack.push(mem_page);
                             if let Some(c) = c {
-                                io_yield_one!(c);
+                                ios.push(c);
+                                io_yield_many!(ios);
+                            } else if !ios.is_empty() {
+                                io_yield_one!(ios.remove(0));
                             }
                         }
 
@@ -1427,6 +1453,13 @@ impl BTreeCursor {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     let left_child_page =
                         contents.cell_interior_read_left_child_page(nearest_matching_cell);
+                    let mut ios = vec![];
+                    let next = left_child_page as usize;
+                    if let Some(prev) = self.pager.last_io_page() {
+                        if let Some(c) = self.pager.maybe_prefetch_after(prev, next) {
+                            ios.push(c);
+                        }
+                    }
                     self.stack.set_cell_index(nearest_matching_cell as i32);
                     let (mem_page, c) = self.read_page(left_child_page as usize)?;
                     self.stack.push(mem_page);
@@ -1434,20 +1467,29 @@ impl BTreeCursor {
                         eq_seen: Cell::new(eq_seen.get()),
                     };
                     if let Some(c) = c {
-                        io_yield_one!(c);
+                        ios.push(c);
+                        io_yield_many!(ios);
                     }
                     continue;
                 }
                 self.stack.set_cell_index(cell_count as i32 + 1);
                 match contents.rightmost_pointer() {
                     Some(right_most_pointer) => {
+                        let next = right_most_pointer as usize;
+                        let mut ios = vec![];
+                        if let Some(prev) = self.pager.last_io_page() {
+                            if let Some(c) = self.pager.maybe_prefetch_after(prev, next) {
+                                ios.push(c);
+                            }
+                        }
                         let (mem_page, c) = self.read_page(right_most_pointer as usize)?;
                         self.stack.push(mem_page);
                         self.seek_state = CursorSeekState::MovingBetweenPages {
                             eq_seen: Cell::new(eq_seen.get()),
                         };
                         if let Some(c) = c {
-                            io_yield_one!(c);
+                            ios.push(c);
+                            io_yield_many!(ios);
                         }
                         continue;
                     }
@@ -5775,6 +5817,7 @@ pub fn integrity_check(
     }
 }
 
+#[inline(always)]
 pub fn btree_read_page(
     pager: &Rc<Pager>,
     page_idx: usize,
@@ -7376,7 +7419,7 @@ mod tests {
         schema::IndexColumn,
         storage::{
             database::DatabaseFile,
-            page_cache::DumbLruPageCache,
+            page_cache::PageCache,
             pager::{AtomicDbState, DbState},
             sqlite3_ondisk::PageSize,
         },
@@ -8631,7 +8674,7 @@ mod tests {
                 db_file,
                 Some(wal),
                 io,
-                Arc::new(parking_lot::RwLock::new(DumbLruPageCache::new(10))),
+                Arc::new(parking_lot::RwLock::new(PageCache::new(10))),
                 buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),

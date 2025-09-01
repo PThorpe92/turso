@@ -342,6 +342,11 @@ pub type BufferData = Pin<Box<[u8]>>;
 pub enum Buffer {
     Heap(BufferData),
     Pooled(ArenaBuffer),
+    View {
+        ptr: NonNull<u8>,
+        len: usize,
+        parent: Arc<Buffer>,
+    },
 }
 
 impl Debug for Buffer {
@@ -349,6 +354,7 @@ impl Debug for Buffer {
         match self {
             Self::Pooled(p) => write!(f, "Pooled(len={})", p.logical_len()),
             Self::Heap(buf) => write!(f, "{buf:?}: {}", buf.len()),
+            Self::View { len, .. } => write!(f, "View(len={len})"),
         }
     }
 }
@@ -379,6 +385,7 @@ impl Buffer {
         match self {
             Self::Heap { .. } => None,
             Self::Pooled(buf) => buf.fixed_id(),
+            Self::View { parent, .. } => parent.fixed_id(),
         }
     }
 
@@ -396,10 +403,21 @@ impl Buffer {
         })
     }
 
+    pub fn new_view(parent: Arc<Buffer>, off: usize, len: usize) -> Buffer {
+        let base = match &*parent {
+            Buffer::Heap(b) => b.as_ptr(),
+            Buffer::Pooled(ab) => ab.as_ptr(),
+            Buffer::View { ptr, .. } => ptr.as_ptr(),
+        };
+        let ptr = unsafe { NonNull::new_unchecked(base.add(off) as *mut u8) };
+        Buffer::View { parent, ptr, len }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::Heap(buf) => buf.len(),
             Self::Pooled(buf) => buf.logical_len(),
+            Self::View { len, .. } => *len,
         }
     }
 
@@ -414,6 +432,10 @@ impl Buffer {
                 unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) }
             }
             Self::Pooled(buf) => buf,
+            Self::View { ptr, len, .. } => {
+                // SAFETY: The buffer is guaranteed to be valid for the lifetime of the slice
+                unsafe { std::slice::from_raw_parts(ptr.as_ptr(), *len) }
+            }
         }
     }
 
@@ -426,6 +448,7 @@ impl Buffer {
         match self {
             Self::Heap(buf) => buf.as_ptr(),
             Self::Pooled(buf) => buf.as_ptr(),
+            Self::View { ptr, .. } => ptr.as_ptr(),
         }
     }
     #[inline]
@@ -433,6 +456,7 @@ impl Buffer {
         match self {
             Self::Heap(buf) => buf.as_ptr() as *mut u8,
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
+            Self::View { ptr, .. } => ptr.as_ptr() as *mut u8,
         }
     }
 }

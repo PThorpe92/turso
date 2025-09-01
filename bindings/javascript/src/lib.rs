@@ -607,6 +607,17 @@ impl turso_core::DatabaseStorage for DatabaseFile {
         Ok(c)
     }
 
+    fn fetch_block(
+        &self,
+        first_page_id: usize,
+        page_size: usize,
+        _io_ctx: &turso_core::IOContext,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::Completion> {
+        let pos = first_page_id.saturating_sub(1) * page_size;
+        self.file.pread(pos, c)
+    }
+
     fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
         self.file.sync(c)
     }

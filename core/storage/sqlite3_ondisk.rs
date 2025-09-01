@@ -926,6 +926,16 @@ pub fn begin_read_page(
     db_file.read_page(page_idx, io_ctx, c)
 }
 
+pub fn begin_read_block(
+    db_file: Arc<dyn DatabaseStorage>,
+    completion: Completion,
+    page_size: usize,
+    page_start: usize,
+    io_ctx: &IOContext,
+) -> Result<Completion> {
+    db_file.fetch_block(page_start, page_size, io_ctx, completion)
+}
+
 #[instrument(skip_all, level = Level::INFO)]
 pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");

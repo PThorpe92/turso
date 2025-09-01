@@ -1,4 +1,5 @@
 use crate::result::LimboResult;
+use crate::storage::page_cache::DumbLruPageCache;
 use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
@@ -10,14 +11,14 @@ use crate::storage::{
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-use crate::{io_yield_many, io_yield_one, IOContext};
+use crate::{io_yield_many, io_yield_one, Buffer, IOContext};
 use crate::{
     return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection, IOResult, LimboError,
     Result, TransactionState,
 };
 use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell, UnsafeCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::hash;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,13 +26,15 @@ use std::sync::{Arc, Mutex};
 use tracing::{instrument, trace, Level};
 
 use super::btree::btree_init_page;
-use super::page_cache::{CacheError, CacheResizeResult, DumbLruPageCache, PageCacheKey};
+use super::page_cache::{CacheError, CacheResizeResult, PageCacheKey};
 use super::sqlite3_ondisk::begin_write_btree_page;
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
+pub const DEFAULT_BLOCK_PAGES: usize = 64;
+const DEFAULT_MAX_INFLIGHT_BLOCKS: usize = 4;
 
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
@@ -129,7 +132,7 @@ pub struct PageInner {
     /// requests unpinning via [Page::unpin], the pin count will still be >0 if the outer
     /// code path has not yet requested to unpin the page as well.
     ///
-    /// Note that [DumbLruPageCache::clear] evicts the pages even if pinned, so as long as
+    /// Note that [PageCache::clear] evicts the pages even if pinned, so as long as
     /// we clear the page cache on errors, pins will not 'leak'.
     pub pin_count: AtomicUsize,
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
@@ -454,8 +457,6 @@ enum BtreeCreateVacuumFullState {
     PtrMapPut { allocated_page_id: u32 },
 }
 
-/// The pager interface implements the persistence layer by providing access
-/// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
 pub struct Pager {
     /// Source of the database pages.
@@ -489,6 +490,10 @@ pub struct Pager {
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
     pub(crate) page_size: Cell<Option<PageSize>>,
+    prefetcher: Prefetcher,
+    prefetch_last_block_idx: Cell<Option<usize>>,
+    seq_hint_last_page: Cell<Option<usize>>,
+    cache_epoch: Arc<AtomicUsize>,
     reserved_space: OnceCell<u8>,
     free_page_state: RefCell<FreePageState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
@@ -559,6 +564,120 @@ enum FreePageState {
     },
 }
 
+struct Prefetcher {
+    cfg: PrefetcherConfig,
+    inflight: Arc<AtomicUsize>,
+    inflight_keys: Arc<Mutex<HashSet<u64>>>,
+    recent: Arc<Mutex<RecentBlocks>>,
+}
+
+struct RecentBlocks {
+    seen: HashSet<u64>,
+    order: VecDeque<u64>,
+    cap: usize,
+}
+
+impl Default for Prefetcher {
+    fn default() -> Self {
+        Self {
+            cfg: PrefetcherConfig::default(),
+            inflight: AtomicUsize::new(0).into(),
+            inflight_keys: Arc::new(Mutex::new(HashSet::new())),
+            recent: Arc::new(Mutex::new(RecentBlocks {
+                seen: Default::default(),
+                order: Default::default(),
+                cap: 256,
+            })),
+        }
+    }
+}
+
+impl Prefetcher {
+    fn block_key(start: usize, npages: usize) -> u64 {
+        let idx = ((start - 1) / npages) as u64;
+        (idx << 32) | (npages as u64)
+    }
+
+    fn cancel(&self, key: u64) {
+        let mut infl = self.inflight_keys.lock().unwrap();
+        infl.remove(&key);
+    }
+
+    fn reset_inflight(&self) -> Arc<dyn Fn(u64) + Send + Sync> {
+        let recent = self.recent.clone();
+        let inflight = self.inflight_keys.clone();
+        Arc::new(move |key| {
+            {
+                let mut infl = inflight.lock().unwrap();
+                infl.remove(&key);
+            }
+            let mut r = recent.lock().unwrap();
+            r.seen.insert(key);
+            r.order.push_back(key);
+            if r.order.len() > r.cap {
+                if let Some(old) = r.order.pop_front() {
+                    r.seen.remove(&old);
+                }
+            }
+        })
+    }
+
+    fn begin(&self, start: usize, npages: usize) -> Option<u64> {
+        let key = Self::block_key(start, npages);
+        // reject if already inflight
+        {
+            let mut infl = self.inflight_keys.lock().unwrap();
+            if infl.contains(&key) {
+                return None;
+            }
+            infl.insert(key);
+        }
+        // reject if recently done
+        {
+            let r = self.recent.lock().unwrap();
+            if r.seen.contains(&key) {
+                // undo inflight insert
+                let mut infl = self.inflight_keys.lock().unwrap();
+                infl.remove(&key);
+                return None;
+            }
+        }
+        Some(key)
+    }
+
+    fn finish(&self, key: u64) {
+        // remove from inflight, add to recent (with eviction)
+        {
+            let mut infl = self.inflight_keys.lock().unwrap();
+            infl.remove(&key);
+        }
+        let mut r = self.recent.lock().unwrap();
+        r.seen.insert(key);
+        r.order.push_back(key);
+        if r.order.len() > r.cap {
+            if let Some(old) = r.order.pop_front() {
+                r.seen.remove(&old);
+            }
+        }
+    }
+}
+
+pub struct PrefetcherConfig {
+    /// Default 64 pages per block
+    pub block_pages: usize,
+    /// Default 4 in-flight blocks
+    pub max_inflight_blocks: usize,
+}
+
+impl Default for PrefetcherConfig {
+    fn default() -> Self {
+        Self {
+            block_pages: DEFAULT_BLOCK_PAGES,
+            max_inflight_blocks: DEFAULT_MAX_INFLIGHT_BLOCKS,
+        }
+    }
+}
+
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
@@ -595,6 +714,10 @@ impl Pager {
             init_lock,
             allocate_page1_state,
             page_size: Cell::new(None),
+            prefetcher: Prefetcher::default(),
+            prefetch_last_block_idx: Cell::new(None),
+            seq_hint_last_page: Cell::new(None),
+            cache_epoch: Arc::new(AtomicUsize::new(0)),
             reserved_space: OnceCell::new(),
             free_page_state: RefCell::new(FreePageState::Start),
             allocate_page_state: RefCell::new(AllocatePageState::Start),
@@ -608,6 +731,153 @@ impl Pager {
             btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
             io_ctx: RefCell::new(IOContext::default()),
         })
+    }
+
+    #[inline]
+    pub fn note_page_accessed(&self, pgno: usize) {
+        self.seq_hint_last_page.set(Some(pgno));
+    }
+
+    #[inline]
+    pub fn last_io_page(&self) -> Option<usize> {
+        self.seq_hint_last_page.get()
+    }
+
+    pub fn maybe_prefetch_after(&self, last: usize, current: usize) -> Option<Completion> {
+        if current != last + 1 {
+            return None;
+        }
+        let b = self.prefetcher.cfg.block_pages;
+        // compute next aligned block
+        let next_block_idx = ((current - 1) / b) + 1;
+        let next_block_start = 1 + next_block_idx * b;
+        // only suppress duplicates within the same block index
+        if self.prefetch_last_block_idx.get() == Some(next_block_idx) {
+            return None;
+        }
+        self.prefetch_last_block_idx.set(Some(next_block_idx));
+        self.prefetch_block(next_block_start, b)
+    }
+
+    pub fn prefetch_block(&self, first_page_idx: usize, npages: usize) -> Option<Completion> {
+        if npages == 0 || first_page_idx < 1 {
+            return None;
+        }
+        // throttle
+        if self.prefetcher.inflight.load(Ordering::Relaxed)
+            >= self.prefetcher.cfg.max_inflight_blocks
+        {
+            return None;
+        }
+        // dedupe: deny if same block is inflight or recently done
+        let key = self.prefetcher.begin(first_page_idx, npages)?;
+
+        // page size must be known
+        let ps = self.page_size.get()?;
+        let page_sz = ps.get() as usize;
+
+        let block_buf = Arc::new(self.buffer_pool.get_block());
+
+        let page_cache = Arc::clone(&self.page_cache);
+        let wal_opt = self.wal.as_ref().map(Rc::clone);
+        let inflight = Arc::clone(&self.prefetcher.inflight);
+        let epoch = self.cache_epoch.load(Ordering::Acquire);
+        let cache_epoch = Arc::clone(&self.cache_epoch);
+
+        let prefetcher_finish = self.prefetcher.reset_inflight();
+        inflight.fetch_add(1, Ordering::Relaxed);
+
+        let key_for_guard = key;
+        let c = Completion::new_read(block_buf.clone(), move |res| {
+            struct Guard {
+                inflight: Arc<AtomicUsize>,
+                finish: Arc<dyn Fn(u64) + Send + Sync>,
+                key: u64,
+            }
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    (self.finish)(self.key);
+                    self.inflight.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let _g = Guard {
+                inflight: inflight.clone(),
+                finish: prefetcher_finish.clone(),
+                key: key_for_guard,
+            };
+
+            let Ok((buf, bytes_read)) = res else {
+                return;
+            };
+            if cache_epoch.load(Ordering::Acquire) != epoch {
+                tracing::debug!("prefetch aborted due to cache epoch change");
+                return;
+            }
+
+            // ingest partial tails too
+            let pages_read = (bytes_read as usize) / page_sz;
+            if pages_read == 0 {
+                return;
+            }
+
+            // single snapshot for the whole block
+            let wal_snapshot = wal_opt.as_ref().map(|w| w.borrow().get_max_frame());
+
+            let mut cache = page_cache.write();
+            for i in 0..pages_read {
+                let pid = first_page_idx + i;
+
+                let key = PageCacheKey::new(pid);
+                if cache.contains_key(&key) {
+                    tracing::trace!("prefetch skip {pid}, already in cache");
+                    continue;
+                }
+
+                let wal_has_newer = if let Some(wal_rc) = &wal_opt {
+                    matches!(
+                        wal_rc.borrow().find_frame(pid as u64, wal_snapshot),
+                        Ok(Some(_))
+                    )
+                } else {
+                    false
+                };
+                if wal_has_newer {
+                    continue;
+                }
+
+                let page_buf = Buffer::new_view(buf.clone(), i * page_sz, page_sz);
+                let page = Arc::new(Page::new(pid));
+                page.set_loaded();
+                let reserved = if pid == 1 {
+                    sqlite3_ondisk::DatabaseHeader::SIZE
+                } else {
+                    0
+                };
+                page.get().contents = Some(PageContent::new(reserved, page_buf.into()));
+                let _ = cache.insert(key, page);
+            }
+        });
+
+        let submit = sqlite3_ondisk::begin_read_block(
+            self.db_file.clone(),
+            c.clone(),
+            page_sz,
+            first_page_idx,
+            &self.io_ctx.borrow(),
+        );
+
+        if submit.is_err() {
+            // undo begin since we never actually submitted
+            self.prefetcher.cancel(key);
+            self.prefetcher.inflight.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        tracing::debug!(
+            "prefetch submitted block {}-{}",
+            first_page_idx,
+            first_page_idx + npages - 1
+        );
+        Some(c)
     }
 
     /// Get the maximum page count for this database
@@ -1121,6 +1391,7 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
     pub fn read_page(&self, page_idx: usize) -> Result<(PageRef, Option<Completion>)> {
         tracing::trace!("read_page(page_idx = {})", page_idx);
+        self.note_page_accessed(page_idx);
         let mut page_cache = self.page_cache.write();
         let page_key = PageCacheKey::new(page_idx);
         if let Some(page) = page_cache.get(&page_key)? {
@@ -1558,6 +1829,7 @@ impl Pager {
             .write()
             .clear()
             .expect("Failed to clear page cache");
+        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Checkpoint in Truncate mode and delete the WAL file. This method is _only_ to be called
@@ -2471,7 +2743,7 @@ mod ptrmap_tests {
         let pages = initial_db_pages + 10;
         let sz = std::cmp::max(std::cmp::min(pages, 64), pages);
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
-        let page_cache = Arc::new(RwLock::new(DumbLruPageCache::new(sz as usize)));
+        let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),

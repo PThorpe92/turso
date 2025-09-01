@@ -106,6 +106,8 @@ struct PoolInner {
     /// plus 24 byte `WAL_FRAME_HEADER_SIZE`, preventing the fragmentation
     /// or complex book-keeping needed to use the same arena for both sizes.
     wal_frame_arena: Option<Arc<Arena>>,
+    /// An Arena which returns `ArenaBuffer`s of size `db_page_size * 64`
+    block_arena: Option<Arc<Arena>>,
     /// A lock preventing concurrent initialization.
     init_lock: Mutex<()>,
     /// The size of each `Arena`, in bytes.
@@ -150,6 +152,7 @@ impl BufferPool {
                 wal_frame_arena: None,
                 arena_size: arena_size.into(),
                 db_page_size: Self::DEFAULT_PAGE_SIZE.into(),
+                block_arena: None,
                 init_lock: Mutex::new(()),
                 io: None,
             }),
@@ -175,6 +178,17 @@ impl BufferPool {
     pub fn get_wal_frame(&self) -> Buffer {
         let inner = self.inner_mut();
         inner.get_wal_frame_buffer()
+    }
+
+    #[inline]
+    pub fn get_block(&self) -> Buffer {
+        let inner = self.inner_mut();
+        let db_page_size = inner.db_page_size.load(Ordering::Relaxed);
+        inner
+            .block_arena
+            .as_ref()
+            .and_then(|arena| Arena::try_alloc(arena, db_page_size * 64))
+            .unwrap_or(Buffer::new_temporary(db_page_size * 64))
     }
 
     #[inline]
@@ -310,6 +324,25 @@ impl PoolInner {
                 tracing::error!("Failed to create WAL frame arena: {:?}", e);
                 return Err(LimboError::InternalError(format!(
                     "Failed to create WAL frame arena: {e}",
+                )));
+            }
+        }
+
+        let block_size = db_page_size * 64;
+        match Arena::new(block_size, arena_size, &io) {
+            Ok(arena) => {
+                tracing::trace!(
+                    "added block arena {} with size {} MB and slot size {}",
+                    arena.id,
+                    arena_size / (1024 * 1024),
+                    block_size
+                );
+                self.block_arena = Some(Arc::new(arena));
+            }
+            Err(e) => {
+                tracing::error!("Failed to create block arena: {:?}", e);
+                return Err(LimboError::InternalError(format!(
+                    "Failed to create block arena: {e}",
                 )));
             }
         }
