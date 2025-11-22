@@ -21,6 +21,8 @@ pub mod affinity;
 pub mod builder;
 pub mod execute;
 pub mod explain;
+#[allow(dead_code)]
+pub mod hash_table;
 pub mod insn;
 pub mod likeop;
 pub mod metrics;
@@ -44,6 +46,7 @@ use crate::{
             OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
             OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
+        hash_table::HashTable,
         metrics::StatementMetrics,
     },
     ValueRef,
@@ -306,6 +309,19 @@ impl ProgramExecutionState {
     }
 }
 
+/// Re-entrant state for [Insn::HashBuild].
+/// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
+#[derive(Debug, Default)]
+pub struct OpHashBuildState {
+    pub key_values: Vec<Value>,
+    pub key_idx: usize,
+    pub rowid: Option<i64>,
+    pub cursor_id: CursorID,
+    pub hash_table_reg: usize,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -338,6 +354,7 @@ pub struct ProgramState {
     op_insert_state: OpInsertState,
     op_no_conflict_state: OpNoConflictState,
     seek_state: OpSeekState,
+    op_hash_build_state: Option<OpHashBuildState>,
     /// Current collation sequence set by OP_CollSeq instruction
     current_collation: Option<CollationSeq>,
     op_column_state: OpColumnState,
@@ -359,6 +376,8 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+    /// Hash tables for hash join operations, stored by register index
+    hash_tables: HashMap<usize, HashTable>,
 }
 
 impl std::fmt::Debug for Program {
@@ -412,6 +431,7 @@ impl ProgramState {
             },
             op_no_conflict_state: OpNoConflictState::Start,
             seek_state: OpSeekState::Start,
+            op_hash_build_state: None,
             current_collation: None,
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
@@ -422,6 +442,7 @@ impl ProgramState {
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::new(),
+            hash_tables: HashMap::new(),
         }
     }
 
@@ -501,6 +522,7 @@ impl ProgramState {
         };
         self.op_no_conflict_state = OpNoConflictState::Start;
         self.seek_state = OpSeekState::Start;
+        self.op_hash_build_state = None;
         self.current_collation = None;
         self.op_column_state = OpColumnState::Start;
         self.op_row_id_state = OpRowIdState::Start;
@@ -511,6 +533,7 @@ impl ProgramState {
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
         self.rowsets.clear();
+        self.hash_tables.clear();
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {

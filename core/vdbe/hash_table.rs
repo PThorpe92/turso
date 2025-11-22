@@ -1,93 +1,104 @@
-use std::cmp::Eq;
-use std::sync::Arc;
-use tempfile;
-
 use crate::{
     error::LimboError,
     io::{File, IO},
+    translate::collate::CollationSeq,
     turso_assert,
-    types::{IOResult, ImmutableRecord, Value, ValueRef},
+    types::{IOResult, Value, ValueRef},
     Result,
 };
+use rapidhash::fast::RapidHasher;
+use std::cmp::{Eq, Ordering};
+use std::hash::Hasher;
+use std::sync::Arc;
+use tempfile;
 
-/// Hash function for join keys.
-/// Uses FNV-1a hash algorithm which is simple and fast.
-fn hash_join_key(key_values: &[ValueRef]) -> u64 {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
+const DEFAULT_SEED: u64 = 777;
+// TODO: lower when spilling is implemented for this.
+pub const DEFAULT_MEM_BUDGET: usize = 512 * 1024 * 1024;
+const DEFAULT_BUCKETS: usize = 1024;
+const NULL_HASH: u8 = 0;
+const INT_HASH: u8 = 1;
+const FLOAT_HASH: u8 = 2;
+const TEXT_HASH: u8 = 3;
+const BLOB_HASH: u8 = 4;
 
-    let mut hash = FNV_OFFSET_BASIS;
-    for value in key_values {
-        // Hash the value based on its type
+/// Hash function for join keys using xxHash
+/// Takes collation into account when hashing text values
+fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+    let mut hasher = RapidHasher::new(DEFAULT_SEED);
+
+    for (idx, value) in key_values.iter().enumerate() {
         match value {
             ValueRef::Null => {
-                // Hash a special marker for NULL
-                hash ^= 0;
-                hash = hash.wrapping_mul(FNV_PRIME);
+                hasher.write_u8(NULL_HASH);
             }
             ValueRef::Integer(i) => {
-                let bytes = i.to_le_bytes();
-                for byte in bytes {
-                    hash ^= byte as u64;
-                    hash = hash.wrapping_mul(FNV_PRIME);
-                }
+                hasher.write_u8(INT_HASH);
+                hasher.write_i64(*i);
             }
             ValueRef::Float(f) => {
-                let bytes = f.to_le_bytes();
-                for byte in bytes {
-                    hash ^= byte as u64;
-                    hash = hash.wrapping_mul(FNV_PRIME);
-                }
+                hasher.write_u8(FLOAT_HASH);
+                hasher.write(&f.to_le_bytes());
             }
             ValueRef::Text(text) => {
-                for byte in text.as_bytes() {
-                    hash ^= *byte as u64;
-                    hash = hash.wrapping_mul(FNV_PRIME);
+                let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
+                hasher.write_u8(TEXT_HASH);
+                match collation {
+                    CollationSeq::NoCase => {
+                        let lowercase = text.as_str().to_lowercase();
+                        hasher.write(lowercase.as_bytes());
+                    }
+                    CollationSeq::Rtrim => {
+                        let trimmed = text.as_str().trim_end();
+                        hasher.write(trimmed.as_bytes());
+                    }
+                    CollationSeq::Binary | CollationSeq::Unset => {
+                        // Binary collation: hash as-is
+                        hasher.write(text.as_bytes());
+                    }
                 }
             }
             ValueRef::Blob(blob) => {
-                for byte in *blob {
-                    hash ^= *byte as u64;
-                    hash = hash.wrapping_mul(FNV_PRIME);
-                }
+                hasher.write_u8(BLOB_HASH);
+                hasher.write(blob);
             }
         }
     }
-    hash
+    hasher.finish()
 }
 
-/// Check if two key value arrays are equal.
-fn keys_equal(key1: &[Value], key2: &[ValueRef]) -> bool {
+/// Check if two key value arrays are equal, taking collation into account.
+fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
     if key1.len() != key2.len() {
         return false;
     }
-    for (v1, v2) in key1.iter().zip(key2.iter()) {
-        if !values_equal(v1.as_ref(), *v2) {
+    for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
+        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
+        if !values_equal(v1.as_ref(), *v2, collation) {
             return false;
         }
     }
     true
 }
 
-/// Check if two values are equal.
-fn values_equal(v1: ValueRef, v2: ValueRef) -> bool {
+/// Check if two values are equal, using the specified collation for text comparison.
+fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
         (ValueRef::Null, ValueRef::Null) => true,
         (ValueRef::Integer(i1), ValueRef::Integer(i2)) => i1 == i2,
-        (ValueRef::Float(f1), ValueRef::Float(f2)) => {
-            // For hash join equality, we use exact float comparison
-            // This matches SQLite behavior for = operator
-            f1 == f2
-        }
-        (ValueRef::Text(t1), ValueRef::Text(t2)) => t1.as_str() == t2.as_str(),
+        (ValueRef::Float(f1), ValueRef::Float(f2)) => f1 == f2,
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
+        (ValueRef::Text(t1), ValueRef::Text(t2)) => {
+            // Use collation for text comparison
+            collation.compare_strings(t1.as_str(), t2.as_str()) == Ordering::Equal
+        }
         _ => false,
     }
 }
 
 /// State machine states for hash table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HashTableState {
+pub enum HashTableState {
     Building,
     Probing,
     Spilled,
@@ -101,16 +112,17 @@ pub struct HashEntry {
     pub hash: u64,
     /// The join key values.
     pub key_values: Vec<Value>,
-    /// The full row data.
-    pub row_data: ImmutableRecord,
+    /// The rowid of the row in the build table.
+    /// During probe phase, we'll use SeekRowid to fetch the full row.
+    pub rowid: i64,
 }
 
 impl HashEntry {
-    fn new(hash: u64, key_values: Vec<Value>, row_data: ImmutableRecord) -> Self {
+    fn new(hash: u64, key_values: Vec<Value>, rowid: i64) -> Self {
         Self {
             hash,
             key_values,
-            row_data,
+            rowid,
         }
     }
 
@@ -127,7 +139,7 @@ impl HashEntry {
                 Value::Blob(b) => b.len(),
             })
             .sum();
-        key_size + self.row_data.get_payload().len() + 8 // +8 for hash
+        key_size + 8 + 8 // +8 for hash, +8 for rowid
     }
 }
 
@@ -148,10 +160,17 @@ impl HashBucket {
         self.entries.push(entry);
     }
 
-    fn find_matches<'a>(&'a self, hash: u64, probe_keys: &[ValueRef]) -> Vec<&'a HashEntry> {
+    fn find_matches<'a>(
+        &'a self,
+        hash: u64,
+        probe_keys: &[ValueRef],
+        collations: &[CollationSeq],
+    ) -> Vec<&'a HashEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.hash == hash && keys_equal(&entry.key_values, probe_keys))
+            .filter(|entry| {
+                entry.hash == hash && keys_equal(&entry.key_values, probe_keys, collations)
+            })
             .collect()
     }
 
@@ -187,14 +206,17 @@ pub struct HashTableConfig {
     pub mem_budget: usize,
     /// Number of keys in the join condition.
     pub num_keys: usize,
+    /// Collation sequences for each join key.
+    pub collations: Vec<CollationSeq>,
 }
 
 impl Default for HashTableConfig {
     fn default() -> Self {
         Self {
-            initial_buckets: 1024,
-            mem_budget: 64 * 1024 * 1024, // 64 MB default
+            initial_buckets: DEFAULT_BUCKETS,
+            mem_budget: DEFAULT_BUCKETS,
             num_keys: 1,
+            collations: vec![CollationSeq::Binary],
         }
     }
 }
@@ -211,6 +233,8 @@ pub struct HashTable {
     mem_budget: usize,
     /// Number of join keys.
     num_keys: usize,
+    /// Collation sequences for each join key.
+    collations: Vec<CollationSeq>,
     /// Whether the hash table has spilled to disk.
     spilled: bool,
     /// Current state of the hash table.
@@ -230,18 +254,16 @@ pub struct HashTable {
 impl HashTable {
     /// Create a new hash table.
     pub fn new(config: HashTableConfig, io: Arc<dyn IO>) -> Self {
-        let num_buckets = config.initial_buckets;
-        let mut buckets = Vec::with_capacity(num_buckets);
-        for _ in 0..num_buckets {
-            buckets.push(HashBucket::new());
-        }
-
+        let buckets = (0..config.initial_buckets)
+            .map(|_| HashBucket::new())
+            .collect();
         Self {
             buckets,
             num_entries: 0,
             mem_used: 0,
             mem_budget: config.mem_budget,
             num_keys: config.num_keys,
+            collations: config.collations,
             spilled: false,
             state: HashTableState::Building,
             io,
@@ -252,32 +274,30 @@ impl HashTable {
         }
     }
 
+    /// Get the current state of the hash table.
+    pub fn get_state(&self) -> &HashTableState {
+        &self.state
+    }
+
     /// Insert a row into the hash table.
-    /// Returns Ok(IOResult::Done(())) on success.
-    /// Returns Ok(IOResult::IO(...)) if spilling to disk is needed (async I/O).
-    pub fn insert(
-        &mut self,
-        key_values: Vec<Value>,
-        row_data: ImmutableRecord,
-    ) -> Result<IOResult<()>> {
+    pub fn insert(&mut self, key_values: Vec<Value>, rowid: i64) -> Result<IOResult<()>> {
         turso_assert!(
             self.state == HashTableState::Building,
             "Cannot insert into hash table in state {:?}",
             self.state
         );
 
-        // Compute hash of the join keys
+        // Compute hash of the join keys using collations
         let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).collect();
-        let hash = hash_join_key(&key_refs);
+        let hash = hash_join_key(&key_refs, &self.collations);
 
-        // Create entry
-        let entry = HashEntry::new(hash, key_values, row_data);
+        let entry = HashEntry::new(hash, key_values, rowid);
         let entry_size = entry.size_bytes();
 
         // Check if we would exceed memory budget
         if self.mem_used + entry_size > self.mem_budget && !self.spilled {
+            // TODO(preston): Implement spilling to disk with grace hash join
             // For MVP, we'll just return an error instead of implementing grace hash join
-            // TODO: Implement spilling to disk with grace hash join
             return Err(LimboError::InternalError(
                 "Hash table memory budget exceeded. Grace hash join not yet implemented."
                     .to_string(),
@@ -303,9 +323,7 @@ impl HashTable {
         self.state = HashTableState::Probing;
     }
 
-    /// Probe the hash table with the given keys.
-    /// Returns the first matching entry if found, or None if no match.
-    /// Call `next_match()` to get subsequent matches.
+    /// Probe the hash table with the given keys, returns the first matching entry if found
     pub fn probe(&mut self, probe_keys: Vec<Value>) -> Option<&HashEntry> {
         turso_assert!(
             self.state == HashTableState::Probing,
@@ -316,10 +334,10 @@ impl HashTable {
         // Store probe keys first
         self.current_probe_keys = Some(probe_keys);
 
-        // Compute hash of probe keys
+        // Compute hash of probe keys using collations
         let probe_keys_ref = self.current_probe_keys.as_ref().unwrap();
         let key_refs: Vec<ValueRef> = probe_keys_ref.iter().map(|v| v.as_ref()).collect();
-        let hash = hash_join_key(&key_refs);
+        let hash = hash_join_key(&key_refs, &self.collations);
 
         // Find the bucket
         let bucket_idx = (hash as usize) % self.buckets.len();
@@ -329,17 +347,15 @@ impl HashTable {
         // Search for matches in the bucket
         let bucket = &self.buckets[bucket_idx];
         for (idx, entry) in bucket.entries.iter().enumerate() {
-            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs) {
+            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations) {
                 self.probe_entry_idx = idx + 1; // Next call to next_match starts here
                 return Some(entry);
             }
         }
-
         None
     }
 
     /// Get the next matching entry for the current probe keys.
-    /// Returns Some(entry) if another match is found, or None if no more matches.
     pub fn next_match(&mut self) -> Option<&HashEntry> {
         turso_assert!(
             self.state == HashTableState::Probing,
@@ -349,17 +365,16 @@ impl HashTable {
 
         let probe_keys = self.current_probe_keys.as_ref()?;
         let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).collect();
-        let hash = hash_join_key(&key_refs);
+        let hash = hash_join_key(&key_refs, &self.collations);
 
         let bucket = &self.buckets[self.probe_bucket_idx];
         for idx in self.probe_entry_idx..bucket.entries.len() {
             let entry = &bucket.entries[idx];
-            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs) {
+            if entry.hash == hash && keys_equal(&entry.key_values, &key_refs, &self.collations) {
                 self.probe_entry_idx = idx + 1;
                 return Some(entry);
             }
         }
-
         None
     }
 
@@ -429,27 +444,37 @@ pub struct HashTableStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{types::ImmutableRecord, PlatformIO};
+    use crate::PlatformIO;
 
     #[test]
     fn test_hash_function_consistency() {
         // Test that the same keys produce the same hash
         let keys1 = vec![
             ValueRef::Integer(42),
-            ValueRef::Text("hello".into()),
+            ValueRef::Text(crate::types::TextRef::new(
+                "hello",
+                crate::types::TextSubtype::Text,
+            )),
         ];
         let keys2 = vec![
             ValueRef::Integer(42),
-            ValueRef::Text("hello".into()),
+            ValueRef::Text(crate::types::TextRef::new(
+                "hello",
+                crate::types::TextSubtype::Text,
+            )),
         ];
         let keys3 = vec![
             ValueRef::Integer(43),
-            ValueRef::Text("hello".into()),
+            ValueRef::Text(crate::types::TextRef::new(
+                "hello",
+                crate::types::TextSubtype::Text,
+            )),
         ];
 
-        let hash1 = hash_join_key(&keys1);
-        let hash2 = hash_join_key(&keys2);
-        let hash3 = hash_join_key(&keys3);
+        let collations = vec![CollationSeq::Binary, CollationSeq::Binary];
+        let hash1 = hash_join_key(&keys1, &collations);
+        let hash2 = hash_join_key(&keys2, &collations);
+        let hash3 = hash_join_key(&keys3, &collations);
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
@@ -457,12 +482,25 @@ mod tests {
 
     #[test]
     fn test_keys_equal() {
-        let key1 = vec![Value::Integer(42), Value::Text("hello".into())];
-        let key2 = vec![ValueRef::Integer(42), ValueRef::Text("hello".into())];
-        let key3 = vec![ValueRef::Integer(43), ValueRef::Text("hello".into())];
+        let key1 = vec![Value::Integer(42), Value::Text("hello".to_string().into())];
+        let key2 = vec![
+            ValueRef::Integer(42),
+            ValueRef::Text(crate::types::TextRef::new(
+                "hello",
+                crate::types::TextSubtype::Text,
+            )),
+        ];
+        let key3 = vec![
+            ValueRef::Integer(43),
+            ValueRef::Text(crate::types::TextRef::new(
+                "hello",
+                crate::types::TextSubtype::Text,
+            )),
+        ];
 
-        assert!(keys_equal(&key1, &key2));
-        assert!(!keys_equal(&key1, &key3));
+        let collations = vec![CollationSeq::Binary, CollationSeq::Binary];
+        assert!(keys_equal(&key1, &key2, &collations));
+        assert!(!keys_equal(&key1, &key3, &collations));
     }
 
     #[test]
@@ -472,29 +510,32 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
+            collations: vec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
-        // Insert some entries
+        // Insert some entries (late materialization - only store rowids)
         let key1 = vec![Value::Integer(1)];
-        let record1 = ImmutableRecord::from_values(&[Value::Integer(1), Value::Text("row1".into())], 2);
-        ht.insert(key1.clone(), record1).unwrap();
+        let _ = ht.insert(key1.clone(), 100).unwrap();
 
         let key2 = vec![Value::Integer(2)];
-        let record2 = ImmutableRecord::from_values(&[Value::Integer(2), Value::Text("row2".into())], 2);
-        ht.insert(key2.clone(), record2).unwrap();
+        let _ = ht.insert(key2.clone(), 200).unwrap();
 
         ht.finalize_build();
 
         // Probe for key1
         let result = ht.probe(key1.clone());
         assert!(result.is_some());
-        assert_eq!(result.unwrap().key_values[0].as_ref(), ValueRef::Integer(1));
+        let entry1 = result.unwrap();
+        assert_eq!(entry1.key_values[0].as_ref(), ValueRef::Integer(1));
+        assert_eq!(entry1.rowid, 100);
 
         // Probe for key2
         let result = ht.probe(key2);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().key_values[0].as_ref(), ValueRef::Integer(2));
+        let entry2 = result.unwrap();
+        assert_eq!(entry2.key_values[0].as_ref(), ValueRef::Integer(2));
+        assert_eq!(entry2.rowid, 200);
 
         // Probe for non-existent key
         let result = ht.probe(vec![Value::Integer(999)]);
@@ -508,14 +549,14 @@ mod tests {
             initial_buckets: 2, // Small number to force collisions
             mem_budget: 1024 * 1024,
             num_keys: 1,
+            collations: vec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
-        // Insert multiple entries
+        // Insert multiple entries (late materialization - only store rowids)
         for i in 0..10 {
             let key = vec![Value::Integer(i)];
-            let record = ImmutableRecord::from_values(&[Value::Integer(i)], 1);
-            ht.insert(key, record).unwrap();
+            let _ = ht.insert(key, i * 100).unwrap();
         }
 
         ht.finalize_build();
@@ -524,7 +565,9 @@ mod tests {
         for i in 0..10 {
             let result = ht.probe(vec![Value::Integer(i)]);
             assert!(result.is_some());
-            assert_eq!(result.unwrap().key_values[0].as_ref(), ValueRef::Integer(i));
+            let entry = result.unwrap();
+            assert_eq!(entry.key_values[0].as_ref(), ValueRef::Integer(i));
+            assert_eq!(entry.rowid, i * 100);
         }
 
         let stats = ht.stats();
@@ -539,14 +582,14 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
+            collations: vec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
         // Insert multiple entries with the same key
         let key = vec![Value::Integer(42)];
         for i in 0..3 {
-            let record = ImmutableRecord::from_values(&[Value::Integer(42), Value::Integer(i)], 2);
-            ht.insert(key.clone(), record).unwrap();
+            let _ = ht.insert(key.clone(), 1000 + i).unwrap();
         }
 
         ht.finalize_build();
@@ -554,13 +597,16 @@ mod tests {
         // Probe should return first match
         let result = ht.probe(key.clone());
         assert!(result.is_some());
+        assert_eq!(result.unwrap().rowid, 1000);
 
         // next_match should return additional matches
         let result2 = ht.next_match();
         assert!(result2.is_some());
+        assert_eq!(result2.unwrap().rowid, 1001);
 
         let result3 = ht.next_match();
         assert!(result3.is_some());
+        assert_eq!(result3.unwrap().rowid, 1002);
 
         // No more matches
         let result4 = ht.next_match();

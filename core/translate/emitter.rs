@@ -35,7 +35,7 @@ use crate::translate::fkeys::{
     emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
+    DeletePlan, EvalAt, HashJoinOp, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::subquery::emit_non_from_clause_subquery;
@@ -49,7 +49,7 @@ use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::{insn::Insn, BranchOffset};
+use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
 
@@ -166,6 +166,12 @@ pub struct TranslateCtx<'a> {
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
+    /// Hash table register and metadata for hash joins
+    /// Contains: (hash_table_reg, match_reg, build_cursor_id, HashJoinOp)
+    pub hash_table_reg: Option<(usize, usize, CursorID, HashJoinOp)>,
+    /// Label for hash join match processing (points to just after HashProbe instruction)
+    /// Used by HashNext to jump back to process additional matches without re-probing
+    pub hash_join_match_found_label: Option<BranchOffset>,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -191,6 +197,8 @@ impl<'a> TranslateCtx<'a> {
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
+            hash_table_reg: None,
+            hash_join_match_found_label: None,
         }
     }
 }
@@ -806,6 +814,9 @@ fn emit_delete_insns<'a>(
         },
         Operation::IndexMethodQuery(_) => {
             panic!("access through IndexMethod is not supported for delete statements")
+        }
+        Operation::HashJoin(_) => {
+            panic!("Hash joins should not occur in DELETE operations")
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
@@ -1616,6 +1627,9 @@ fn emit_update_insns<'a>(
         },
         Operation::IndexMethodQuery(_) => {
             panic!("access through IndexMethod is not supported for update operations")
+        }
+        Operation::HashJoin(_) => {
+            panic!("Hash joins are not supported in UPDATE operations")
         }
     };
 

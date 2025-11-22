@@ -1271,15 +1271,22 @@ pub enum Insn {
     },
 
     /// Build a hash table from a cursor for hash join.
-    /// Scan through cursor_id, extract join keys from registers key_start_reg..key_start_reg+num_keys-1,
-    /// and build an in-memory hash table. Store the hash table state in hash_table_reg.
-    /// If memory exceeds mem_budget, return an error (grace hash join not yet implemented).
+    /// Extract join keys from the current row of cursor_id (registers key_start_reg..key_start_reg+num_keys-1),
+    /// and insert the current row into the in-memory hash table stored in hash_table_reg.
+    /// Creates the hash table on first call. If memory exceeds mem_budget, return an error.
     HashBuild {
         cursor_id: CursorID,
         key_start_reg: usize,
         num_keys: usize,
         hash_table_reg: usize,
         mem_budget: usize,
+        collations: Vec<CollationSeq>,
+    },
+
+    /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
+    /// Should be called after the HashBuild loop completes.
+    HashBuildFinalize {
+        hash_table_reg: usize,
     },
 
     /// Probe a hash table for matches.
@@ -1297,9 +1304,11 @@ pub enum Insn {
 
     /// Advance to next matching row in hash table bucket.
     /// Used for handling hash collisions and duplicate keys.
-    /// Jump to target_pc if more matches exist, otherwise fall through.
+    /// If another match is found, store it in dest_reg and continue to next instruction.
+    /// If no more matches, jump to target_pc.
     HashNext {
         hash_table_reg: usize,
+        dest_reg: usize,
         target_pc: BranchOffset,
     },
 
@@ -1489,6 +1498,7 @@ impl InsnVariants {
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::HashBuild => execute::op_hash_build,
+            InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
             InsnVariants::HashProbe => execute::op_hash_probe,
             InsnVariants::HashNext => execute::op_hash_next,
             InsnVariants::HashClose => execute::op_hash_close,

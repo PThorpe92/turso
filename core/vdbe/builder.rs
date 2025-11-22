@@ -871,6 +871,8 @@ impl ProgramBuilder {
                 Insn::FkIfZero { target_pc, .. } => {
                     resolve(target_pc, "FkIfZero");
                 }
+                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe"),
+                Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext"),
                 _ => {}
             }
         }
