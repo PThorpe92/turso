@@ -68,6 +68,18 @@ int sqlite3_initialize(void);
 
 int sqlite3_shutdown(void);
 
+int sqlite3_open16(const void *filename, sqlite3 **db_out);
+
+int sqlite3_enable_load_extension(sqlite3 *db, int onoff);
+
+int sqlite3_load_extension(sqlite3 *db, const char *zFile, const char *zProc, char **pzErrMsg);
+
+int sqlite3_auto_extension(void (*xEntryPoint)(void));
+
+int sqlite3_cancel_auto_extension(void (*xEntryPoint)(void));
+
+void sqlite3_reset_auto_extension(void);
+
 int sqlite3_open(const char *filename, sqlite3 **db_out);
 
 int sqlite3_open_v2(const char *filename, sqlite3 **db_out, int _flags, const char *_z_vfs);
@@ -101,6 +113,8 @@ int sqlite3_exec(sqlite3 *db, const char *sql, exec_callback _callback, void *_c
 
 int sqlite3_reset(sqlite3_stmt *stmt);
 
+int sqlite3_prepare16_v2(sqlite3 *db, const void *sql, int _len, sqlite3_stmt **out_stmt, const void **_tail);
+
 int sqlite3_changes(sqlite3 *_db);
 
 int64_t sqlite3_changes64(sqlite3 *_db);
@@ -132,6 +146,10 @@ void sqlite3_sleep(int _ms);
 int sqlite3_limit(sqlite3 *_db, int _id, int _new_value);
 
 void *sqlite3_malloc64(int _n);
+
+void *sqlite3_realloc(void *_ptr, int _n);
+
+void *sqlite3_realloc64(void *_ptr, int _n);
 
 void sqlite3_free(void *_ptr);
 

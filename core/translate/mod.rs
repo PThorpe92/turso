@@ -65,7 +65,6 @@ use turso_parser::ast::{self, Indexed};
 use update::translate_update;
 
 #[instrument(skip_all, level = Level::DEBUG)]
-#[allow(clippy::too_many_arguments)]
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,

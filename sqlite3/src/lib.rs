@@ -1,11 +1,15 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+mod ext;
+
 use std::ffi::{self, CStr, CString};
 use std::num::{NonZero, NonZeroUsize};
 use tracing::trace;
 use turso_core::{CheckpointMode, LimboError, Value};
 
+#[cfg(not(target_family = "wasm"))]
+use libloading::Library;
 use std::sync::{Arc, Mutex};
 
 macro_rules! stub {
@@ -80,6 +84,9 @@ struct sqlite3Inner {
     pub(crate) p_err: *mut ffi::c_void,
     pub(crate) filename: CString,
     pub(crate) stmt_list: *mut sqlite3_stmt,
+    pub(crate) extensions_enabled: bool,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) loaded_extensions: Vec<Library>,
 }
 
 impl sqlite3 {
@@ -100,6 +107,9 @@ impl sqlite3 {
             p_err: std::ptr::null_mut(),
             filename,
             stmt_list: std::ptr::null_mut(),
+            extensions_enabled: false,
+            #[cfg(not(target_family = "wasm"))]
+            loaded_extensions: Vec::new(),
         };
         #[allow(clippy::arc_with_non_send_sync)]
         let inner = Arc::new(Mutex::new(inner));
@@ -190,7 +200,13 @@ pub unsafe extern "C" fn sqlite3_open(
                 ":memory:" => CString::new("".to_string()).unwrap(),
                 _ => CString::from(filename_cstr),
             };
-            *db_out = Box::leak(Box::new(sqlite3::new(io, db, conn, filename)));
+            let db_ptr = Box::leak(Box::new(sqlite3::new(io, db, conn, filename)));
+            let rc = ext::invoke_auto_extensions(db_ptr);
+            if rc != SQLITE_OK {
+                let _ = Box::from_raw(db_ptr);
+                return rc;
+            }
+            *db_out = db_ptr;
             SQLITE_OK
         }
         Err(e) => {
@@ -212,6 +228,14 @@ pub unsafe extern "C" fn sqlite3_open_v2(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn sqlite3_open16(
+    _filename: *const ffi::c_void,
+    _db_out: *mut *mut sqlite3,
+) -> ffi::c_int {
+    SQLITE_MISUSE
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
     trace!("sqlite3_close");
     if db.is_null() {
@@ -225,6 +249,104 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut sqlite3) -> ffi::c_int {
 pub unsafe extern "C" fn sqlite3_close_v2(db: *mut sqlite3) -> ffi::c_int {
     trace!("sqlite3_close_v2");
     sqlite3_close(db)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_enable_load_extension(
+    db: *mut sqlite3,
+    onoff: ffi::c_int,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db = &*db;
+    let mut inner = db.inner.lock().unwrap();
+    inner.extensions_enabled = onoff != 0;
+    SQLITE_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_load_extension(
+    db: *mut sqlite3,
+    z_file: *const ffi::c_char,
+    z_proc: *const ffi::c_char,
+    pz_err_msg: *mut *mut ffi::c_char,
+) -> ffi::c_int {
+    if db.is_null() || z_file.is_null() {
+        return SQLITE_MISUSE;
+    }
+
+    fn set_err(dest: *mut *mut ffi::c_char, msg: String) -> ffi::c_int {
+        if !dest.is_null() {
+            if let Ok(cstr) = CString::new(msg) {
+                unsafe { *dest = cstr.into_raw() };
+            }
+        }
+        SQLITE_ERROR
+    }
+
+    let file = CStr::from_ptr(z_file);
+    let entrypoint = if z_proc.is_null() {
+        CStr::from_bytes_with_nul(b"sqlite3_extension_init\0").unwrap()
+    } else {
+        CStr::from_ptr(z_proc)
+    };
+
+    let path_str = match file.to_str() {
+        Ok(s) => s,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    let path = match turso_core::resolve_ext_path(path_str) {
+        Ok(path) => path,
+        Err(err) => return set_err(pz_err_msg, err.to_string()),
+    };
+
+    let db = &*db;
+    let mut inner = db.inner.lock().unwrap();
+    if !inner.extensions_enabled {
+        return set_err(pz_err_msg, "extension loading disabled".to_string());
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let rc =
+            ext::load_dynamic_extension(db as *const _ as *mut _, &path, entrypoint, pz_err_msg, &mut inner.loaded_extensions);
+        inner.err_code = rc;
+        rc
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        inner.err_code = SQLITE_MISUSE;
+        SQLITE_MISUSE
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_auto_extension(
+    x_entry_point: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    let Some(func) = x_entry_point else {
+        return SQLITE_MISUSE;
+    };
+    let entry: ext::ExtensionEntryPoint = std::mem::transmute(func);
+    ext::register_auto_extension(entry)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_cancel_auto_extension(
+    x_entry_point: Option<unsafe extern "C" fn()>,
+) -> ffi::c_int {
+    let Some(func) = x_entry_point else {
+        return SQLITE_MISUSE;
+    };
+    let entry: ext::ExtensionEntryPoint = std::mem::transmute(func);
+    ext::cancel_auto_extension(entry)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_reset_auto_extension() {
+    ext::reset_auto_extensions();
 }
 
 #[no_mangle]
@@ -323,6 +445,17 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
 
     *out_stmt = new_stmt;
     SQLITE_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_prepare16_v2(
+    _raw_db: *mut sqlite3,
+    _sql: *const ffi::c_void,
+    _len: ffi::c_int,
+    _out_stmt: *mut *mut sqlite3_stmt,
+    _tail: *mut *const ffi::c_void,
+) -> ffi::c_int {
+    SQLITE_MISUSE
 }
 
 #[no_mangle]
@@ -805,6 +938,26 @@ pub unsafe extern "C" fn sqlite3_malloc64(n: ffi::c_int) -> *mut ffi::c_void {
         return std::ptr::null_mut();
     }
     libc::malloc(n as usize)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_realloc(
+    ptr: *mut ffi::c_void,
+    n: ffi::c_int,
+) -> *mut ffi::c_void {
+    sqlite3_realloc64(ptr, n)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_realloc64(
+    ptr: *mut ffi::c_void,
+    n: ffi::c_int,
+) -> *mut ffi::c_void {
+    if n <= 0 {
+        sqlite3_free(ptr);
+        return std::ptr::null_mut();
+    }
+    libc::realloc(ptr, n as usize)
 }
 
 #[no_mangle]

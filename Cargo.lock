@@ -5060,6 +5060,7 @@ version = "0.4.0-pre.3"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
+ "libloading",
  "tempfile",
  "tracing",
  "tracing-appender",
