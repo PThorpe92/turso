@@ -214,7 +214,7 @@ impl Default for HashTableConfig {
     fn default() -> Self {
         Self {
             initial_buckets: DEFAULT_BUCKETS,
-            mem_budget: DEFAULT_BUCKETS,
+            mem_budget: DEFAULT_MEM_BUDGET,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
         }

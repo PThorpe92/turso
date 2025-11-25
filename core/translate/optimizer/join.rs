@@ -95,17 +95,17 @@ pub fn join_lhs_and_rhs<'a>(
     let rhs_table_number = join_order.last().unwrap().original_idx;
 
     if let Some(_lhs_join) = lhs {
-        // Only consider hash join for 2-way joins (when join_order has exactly 2 tables)
-        if join_order.len() == 2 {
-            let lhs_table_idx = join_order[0].original_idx;
-            let rhs_table_idx = join_order[1].original_idx;
-
+        // Allow a hash join between the immediately preceding table and the current RHS.
+        // Supported for the first hashable pair even if more tables remain.
+        if join_order.len() >= 2 {
+            let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
+            let rhs_table_idx = join_order.last().unwrap().original_idx;
             let lhs_table = &joined_tables[lhs_table_idx];
 
             // Hash join build side currently ignores table/index constraints and iterates
             // with a plain scan. If the chosen access method for the build table already
             // uses constraints (e.g. seeks on an index or rowid), skip hash join to avoid
-            // dropping those filters: especially important for correlated subqueries.
+            // dropping those filters.
             let build_access_method_uses_constraints = lhs
                 .and_then(|join| {
                     join.data
@@ -154,7 +154,7 @@ pub fn join_lhs_and_rhs<'a>(
                 preserves
             });
 
-            // Try hash join with LHS as build table and RHS as probe table
+            // Cardinality estimates
             let build_cardinality = lhs
                 .map(|l| l.output_cardinality as f64)
                 .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
@@ -163,20 +163,17 @@ pub fn join_lhs_and_rhs<'a>(
                 * output_cardinality_multiplier)
                 .max(1.0);
 
-            // If the nested-loop RHS access already uses a selective index/seek, prefer it.
-            let rhs_has_selective_index = if let AccessMethodParams::BTreeTable {
-                ref constraint_refs,
-                ..
-            } = best_access_method.params
-            {
-                !constraint_refs.is_empty()
-            } else {
-                false
-            };
-            // if there is already a selective index on RHS, skip even computing hash join
-            if !rhs_has_selective_index
-                && !build_access_method_uses_constraints
+            let rhs_has_selective_seek = matches!(
+                best_access_method.params,
+                AccessMethodParams::BTreeTable {
+                    ref constraint_refs,
+                    ..
+                } if !constraint_refs.is_empty()
+            );
+
+            if !build_access_method_uses_constraints
                 && !nested_loop_preserves_order
+                && !rhs_has_selective_seek
             {
                 if let Some(hash_join_method) = try_hash_join_access_method(
                     lhs_table,

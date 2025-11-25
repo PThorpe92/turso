@@ -9694,9 +9694,12 @@ pub fn op_hash_build(
         let column_idx = match column_idx_reg.get_value() {
             Value::Integer(idx) => *idx as usize,
             _ => {
-                return Err(LimboError::InternalError(
-                    "HashBuild: expected integer column index in register".to_string(),
-                ));
+                return Err(LimboError::InternalError(format!(
+                    "HashBuild: expected integer column index in register {}, key{}/{}",
+                    key_start_reg + i,
+                    i + 1,
+                    num_keys
+                )));
             }
         };
 

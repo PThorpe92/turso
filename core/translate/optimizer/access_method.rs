@@ -365,10 +365,37 @@ pub fn try_hash_join_access_method(
         return None;
     }
 
+    // Avoid hash join on self-joins over the same underlying table. The current
+    // implementation assumes distinct build/probe sources; sharing storage can
+    // lead to incorrect matches.
+    if build_table
+        .table
+        .btree()
+        .and_then(|b| probe_table.table.btree().map(|p| b.root_page == p.root_page))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
     // Hash joins only support INNER JOIN semantics.
     // Don't use hash joins for OUTER JOINs (LEFT, RIGHT, FULL).
     if build_table.join_info.as_ref().is_some_and(|ji| ji.outer)
         || probe_table.join_info.as_ref().is_some_and(|ji| ji.outer)
+    {
+        return None;
+    }
+
+    // USING/NATURAL joins carry implicit equality constraints that aren't represented
+    // the same way as WHERE-derived predicates; skip hash join for now to avoid
+    // hashing on the wrong keys.
+    if build_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| !ji.using.is_empty())
+        || probe_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| !ji.using.is_empty())
     {
         return None;
     }

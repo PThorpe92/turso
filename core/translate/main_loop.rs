@@ -14,8 +14,8 @@ use super::{
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        Aggregate, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation,
-        QueryDestination, Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
+        Aggregate, GroupBy, IterationDirection, JoinOrderMember, Operation, QueryDestination,
+        Search, SeekDef, SelectPlan, TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -84,20 +84,15 @@ fn is_hash_join_build_table(
     join_order: &[JoinOrderMember],
     table_references: &TableReferences,
 ) -> bool {
-    // Hash joins always build on the table immediately to the left of the HashJoin op.
-    // This helper checks whether the current join index is that build table.
-    if join_index + 1 >= join_order.len() {
-        return false;
-    }
-    let next_table_idx = join_order[join_index + 1].original_idx;
     let current_idx = join_order[join_index].original_idx;
-    matches!(
-        table_references.joined_tables().get(next_table_idx),
-        Some(JoinedTable {
-            op: Operation::HashJoin(hj),
-            ..
-        }) if hj.build_table_idx == current_idx
-    )
+    join_order.iter().skip(join_index + 1).any(|member| {
+        table_references
+            .joined_tables()
+            .get(member.original_idx)
+            .is_some_and(
+                |t| matches!(&t.op, Operation::HashJoin(hj) if hj.build_table_idx == current_idx),
+            )
+    })
 }
 
 pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
@@ -655,7 +650,10 @@ pub fn open_loop(
                 );
 
                 // Hash join build tables don't use seek operations
-                if !is_build_table_for_hash_join {
+                if is_build_table_for_hash_join {
+                    // just resolve the 'dummy' loop here, we skip emitting any seeks
+                    program.preassign_label_to_next_insn(loop_start);
+                } else {
                     // Open the loop for the index search.
                     // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
                     match search {
@@ -902,6 +900,12 @@ pub fn open_loop(
 
                 program.preassign_label_to_next_insn(build_loop_end);
                 program.emit_insn(Insn::HashBuildFinalize { hash_table_reg });
+
+                // Avoid unresolved labels for the build table's normal loop labels since
+                // we bypass the regular open/close loop plumbing for hash build.
+                let build_loop_labels = t_ctx.labels_main_loop[hash_join_op.build_table_idx];
+                program.preassign_label_to_next_insn(build_loop_labels.next);
+                program.preassign_label_to_next_insn(build_loop_labels.loop_end);
 
                 // Hash Table Probe Phase
                 // Iterate through probe table and look up matches in hash table
@@ -1363,6 +1367,9 @@ pub fn close_loop(
             .position(|j| j.original_idx == table_index)
             .is_some_and(|pos| is_hash_join_build_table(pos, join_order, tables))
         {
+            // Resolve labels so any references (e.g., predicates) don't panic.
+            program.resolve_label(loop_labels.next, program.offset());
+            program.resolve_label(loop_labels.loop_end, program.offset());
             continue;
         }
 
@@ -1466,33 +1473,30 @@ pub fn close_loop(
             }
             Operation::HashJoin(_hash_join_op) => {
                 // Probe table: emit logic for iterating through hash matches
-                let is_hash_join_probe_table = t_ctx.hash_table_reg.is_some();
 
-                if is_hash_join_probe_table {
-                    if let Some((hash_table_reg, match_reg, _, _)) = &t_ctx.hash_table_reg {
-                        let hash_table_reg = *hash_table_reg;
-                        let match_reg = *match_reg;
-                        let label_next_probe_row = program.allocate_label();
+                if let Some((hash_table_reg, match_reg, _, _)) = &t_ctx.hash_table_reg {
+                    let hash_table_reg = *hash_table_reg;
+                    let match_reg = *match_reg;
+                    let label_next_probe_row = program.allocate_label();
 
-                        // Check for additional matches with same probe keys
-                        // If found: store in match_reg and continue
-                        // If not found: jump to next probe row
-                        program.emit_insn(Insn::HashNext {
-                            hash_table_reg,
-                            dest_reg: match_reg,
-                            target_pc: label_next_probe_row,
-                        });
+                    // Check for additional matches with same probe keys
+                    // If found: store in match_reg and continue
+                    // If not found: jump to next probe row
+                    program.emit_insn(Insn::HashNext {
+                        hash_table_reg,
+                        dest_reg: match_reg,
+                        target_pc: label_next_probe_row,
+                    });
 
-                        // Jump to match processing (skips HashProbe to preserve iteration state)
-                        let match_found_label = t_ctx
-                            .hash_join_match_found_label
-                            .expect("match_found_label should be set for hash join probe tables");
-                        program.emit_insn(Insn::Goto {
-                            target_pc: match_found_label,
-                        });
+                    // Jump to match processing (skips HashProbe to preserve iteration state)
+                    let match_found_label = t_ctx
+                        .hash_join_match_found_label
+                        .expect("match_found_label should be set for hash join probe tables");
+                    program.emit_insn(Insn::Goto {
+                        target_pc: match_found_label,
+                    });
 
-                        program.preassign_label_to_next_insn(label_next_probe_row);
-                    }
+                    program.preassign_label_to_next_insn(label_next_probe_row);
                 }
 
                 // Advance to next probe row (HashProbe jumps here if no match found)
@@ -1505,13 +1509,11 @@ pub fn close_loop(
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
 
                 // Clean up hash table
-                if is_hash_join_probe_table {
-                    if let Some((hash_table_reg, _, _, _)) = &t_ctx.hash_table_reg {
-                        program.emit_insn(Insn::HashClose {
-                            hash_table_reg: *hash_table_reg,
-                        });
-                        t_ctx.hash_table_reg = None;
-                    }
+                if let Some((hash_table_reg, _, _, _)) = &t_ctx.hash_table_reg {
+                    program.emit_insn(Insn::HashClose {
+                        hash_table_reg: *hash_table_reg,
+                    });
+                    t_ctx.hash_table_reg = None;
                 }
             }
         }
