@@ -7,6 +7,63 @@ use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
 
+/// Represents a foreign key action (ON DELETE / ON UPDATE behavior)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+pub enum ForeignKeyAction {
+    /// No action taken; constraint checked at statement end (default SQLite behavior)
+    #[default]
+    NoAction,
+    /// Prevent the operation if child rows exist
+    Restrict,
+    /// Cascade the operation to child rows (delete/update children)
+    Cascade,
+    /// Set child FK columns to NULL
+    SetNull,
+    /// Set child FK columns to their default values
+    SetDefault,
+}
+
+impl Display for ForeignKeyAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAction => write!(f, "NO ACTION"),
+            Self::Restrict => write!(f, "RESTRICT"),
+            Self::Cascade => write!(f, "CASCADE"),
+            Self::SetNull => write!(f, "SET NULL"),
+            Self::SetDefault => write!(f, "SET DEFAULT"),
+        }
+    }
+}
+
+/// Represents a foreign key constraint on a table
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ForeignKeyConstraint {
+    /// Columns in the child table that form the foreign key
+    pub child_columns: Vec<String>,
+    /// Name of the parent (referenced) table
+    pub parent_table: String,
+    /// Columns in the parent table being referenced (usually the primary key)
+    pub parent_columns: Vec<String>,
+    /// Action to take when parent row is deleted
+    pub on_delete: ForeignKeyAction,
+    /// Action to take when parent row is updated
+    pub on_update: ForeignKeyAction,
+}
+
+impl Display for ForeignKeyConstraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE {} ON UPDATE {}",
+            self.child_columns.join(", "),
+            self.parent_table,
+            self.parent_columns.join(", "),
+            self.on_delete,
+            self.on_update
+        )
+    }
+}
+
 pub struct Name(pub String);
 
 impl Deref for Name {
@@ -47,6 +104,9 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
     pub indexes: Vec<Index>,
+    /// Foreign key constraints defined on this table (this table is the child)
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
 }
 
 impl Table {
@@ -56,6 +116,7 @@ impl Table {
             name: "".to_string(),
             columns: vec![],
             indexes: vec![],
+            foreign_keys: vec![],
         }
     }
 }
@@ -193,7 +254,7 @@ impl SimValue {
     }
 
     #[inline]
-    fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         matches!(self.0, types::Value::Null)
     }
 

@@ -21,6 +21,13 @@ impl Display for Create {
             .map(|column| column.to_string())
             .join(", ");
 
-        write!(f, "{cols})")
+        write!(f, "{cols}")?;
+
+        // Add foreign key constraints as table constraints
+        for fk in &self.table.foreign_keys {
+            write!(f, ", {fk}")?;
+        }
+
+        write!(f, ")")
     }
 }
