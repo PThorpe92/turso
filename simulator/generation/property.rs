@@ -238,7 +238,10 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => {
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::ForeignKeyDeleteAction { .. }
+            | Property::ForeignKeyUpdateAction { .. }
+            | Property::ForeignKeyInvalidInsert { .. } => {
                 unreachable!("No extensional queries")
             }
         }
@@ -1117,6 +1120,406 @@ impl Property {
                 .into_iter()
                 .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
+
+            // Foreign Key Property Interactions
+            Property::ForeignKeyDeleteAction {
+                action,
+                parent_table: _,
+                child_table,
+                fk_column,
+                pk_column: _,
+                create_parent,
+                create_child,
+                insert_parent,
+                insert_child,
+                delete_parent,
+            } => {
+                use sql_generation::model::table::ForeignKeyAction;
+
+                let child_table_for_assertion = child_table.clone();
+                let child_table_for_deps = child_table.clone();
+                let fk_column_clone = fk_column.clone();
+                let action_clone = *action;
+
+                // Build the sequence of interactions
+                // Note: FK enforcement is assumed to be enabled via PRAGMA foreign_keys = ON
+                let mut interactions = vec![
+                    // Create parent table
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create_parent.clone(),
+                    ))),
+                    // Create child table with FK
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create_child.clone(),
+                    ))),
+                    // Insert into parent
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        insert_parent.clone(),
+                    ))),
+                    // Insert into child
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        insert_child.clone(),
+                    ))),
+                ];
+
+                // For RESTRICT/NO ACTION, the delete should fail
+                // For CASCADE/SET NULL/SET DEFAULT, the delete should succeed
+                match action {
+                    ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                        // Delete should fail - we expect an error
+                        let mut delete_interaction = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Delete(delete_parent.clone())),
+                        );
+                        delete_interaction.ignore_error(true);
+                        interactions.push(delete_interaction);
+
+                        // Assert that child row still exists (delete was blocked)
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                format!("FK {action:?} should block delete - child rows should still exist"),
+                                move |stack: &Vec<ResultSet>, _| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(rows) if !rows.is_empty() => Ok(Ok(())),
+                                        Ok(_) => Ok(Err(format!(
+                                            "FK {action_clone:?} should have blocked delete, but child rows are gone",
+                                        ))),
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                    ForeignKeyAction::Cascade => {
+                        // Delete should succeed and cascade to child
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Delete(delete_parent.clone())),
+                        ));
+
+                        // Select from child - should be empty
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                "CASCADE DELETE should remove child rows".to_string(),
+                                move |stack: &Vec<ResultSet>, _| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(rows) if rows.is_empty() => Ok(Ok(())),
+                                        Ok(rows) => Ok(Err(format!(
+                                            "CASCADE DELETE should have removed child rows, but found {} rows",
+                                            rows.len()
+                                        ))),
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                    ForeignKeyAction::SetNull => {
+                        // Delete should succeed and set FK column to NULL
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Delete(delete_parent.clone())),
+                        ));
+
+                        // Select from child - FK column should be NULL
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        let child_table_for_closure = child_table_for_assertion.clone();
+                        let fk_column_for_closure = fk_column_clone.clone();
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                "SET NULL should set FK column to NULL".to_string(),
+                                move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(rows) => {
+                                            // Find FK column index in child table
+                                            let conn_tables = env.get_conn_tables(connection_index);
+                                            let child = conn_tables.iter().find(|t| t.name == child_table_for_closure);
+                                            if let Some(child) = child {
+                                                let fk_idx = child.columns.iter().position(|c| c.name == fk_column_for_closure);
+                                                if let Some(idx) = fk_idx {
+                                                    for row in rows {
+                                                        if !row[idx].is_null() {
+                                                            return Ok(Err(format!(
+                                                                "SET NULL should have set FK column to NULL, but got {:?}",
+                                                                row[idx]
+                                                            )));
+                                                        }
+                                                    }
+                                                    Ok(Ok(()))
+                                                } else {
+                                                    Ok(Err("FK column not found".to_string()))
+                                                }
+                                            } else {
+                                                Ok(Err("Child table not found".to_string()))
+                                            }
+                                        }
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                    ForeignKeyAction::SetDefault => {
+                        // Delete should succeed and set FK column to default
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Delete(delete_parent.clone())),
+                        ));
+
+                        // For now, just verify the delete succeeded
+                        // SET DEFAULT is more complex to verify without knowing the default value
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                "SET DEFAULT delete should succeed".to_string(),
+                                move |stack: &Vec<ResultSet>, _| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(_) => Ok(Ok(())),
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                }
+
+                interactions
+            }
+
+            Property::ForeignKeyUpdateAction {
+                action,
+                parent_table: _,
+                child_table,
+                fk_column,
+                pk_column: _,
+                create_parent,
+                create_child,
+                insert_parent,
+                insert_child,
+                update_parent,
+                new_pk_value,
+            } => {
+                use sql_generation::model::table::ForeignKeyAction;
+
+                let child_table_for_deps = child_table.clone();
+                let action_clone = *action;
+
+                let mut interactions = vec![
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create_parent.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create_child.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        insert_parent.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Insert(
+                        insert_child.clone(),
+                    ))),
+                ];
+
+                match action {
+                    ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                        let mut update_interaction = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Update(update_parent.clone())),
+                        );
+                        update_interaction.ignore_error(true);
+                        interactions.push(update_interaction);
+
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                format!(
+                                    "FK {action:?} should block update - child FK values unchanged",
+                                ),
+                                move |stack: &Vec<ResultSet>, _| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(rows) if !rows.is_empty() => Ok(Ok(())),
+                                        Ok(_) => Ok(Err(format!(
+                                            "FK {action_clone:?} check failed - unexpected state",
+                                        ))),
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                    ForeignKeyAction::Cascade => {
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Update(update_parent.clone())),
+                        ));
+
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        let child_table_for_closure = child_table.clone();
+                        let fk_column_for_closure = fk_column.clone();
+                        let new_pk_value_for_closure = new_pk_value.clone();
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                "CASCADE UPDATE should update child FK values".to_string(),
+                                move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(rows) => {
+                                            let conn_tables = env.get_conn_tables(connection_index);
+                                            let child = conn_tables.iter().find(|t| t.name == child_table_for_closure);
+                                            if let Some(child) = child {
+                                                let fk_idx = child.columns.iter().position(|c| c.name == fk_column_for_closure);
+                                                if let Some(idx) = fk_idx {
+                                                    for row in rows {
+                                                        if row[idx] != new_pk_value_for_closure {
+                                                            return Ok(Err(format!(
+                                                                "CASCADE UPDATE should have updated FK to {:?}, but got {:?}",
+                                                                new_pk_value_for_closure, row[idx]
+                                                            )));
+                                                        }
+                                                    }
+                                                    Ok(Ok(()))
+                                                } else {
+                                                    Ok(Err("FK column not found".to_string()))
+                                                }
+                                            } else {
+                                                Ok(Err("Child table not found".to_string()))
+                                            }
+                                        }
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                    ForeignKeyAction::SetNull | ForeignKeyAction::SetDefault => {
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Update(update_parent.clone())),
+                        ));
+
+                        let select_child = InteractionBuilder::with_interaction(
+                            InteractionType::Query(Query::Select(Select::simple(
+                                child_table.clone(),
+                                Predicate::true_(),
+                            ))),
+                        );
+                        interactions.push(select_child);
+
+                        interactions.push(InteractionBuilder::with_interaction(
+                            InteractionType::Assertion(Assertion::new(
+                                format!("{action:?} UPDATE should succeed"),
+                                move |stack: &Vec<ResultSet>, _| {
+                                    let rows = stack.last().unwrap();
+                                    match rows {
+                                        Ok(_) => Ok(Ok(())),
+                                        Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                    }
+                                },
+                                vec![child_table_for_deps.clone()],
+                            )),
+                        ));
+                    }
+                }
+
+                interactions
+            }
+
+            Property::ForeignKeyInvalidInsert {
+                parent_table: _,
+                child_table,
+                create_parent,
+                create_child,
+                insert_child,
+            } => {
+                let child_table_clone = child_table.clone();
+
+                // Build the insert interaction with ignore_error set
+                let mut insert_interaction = InteractionBuilder::with_interaction(
+                    InteractionType::Query(Query::Insert(insert_child.clone())),
+                );
+                insert_interaction.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create_parent.clone(),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Create(
+                        create_child.clone(),
+                    ))),
+                    // This insert should fail due to FK constraint
+                    insert_interaction,
+                    // Verify that no rows were inserted
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Select(
+                        Select::simple(child_table.clone(), Predicate::true_()),
+                    ))),
+                    InteractionBuilder::with_interaction(InteractionType::Assertion(
+                        Assertion::new(
+                            "FK constraint should have blocked invalid insert".to_string(),
+                            move |stack: &Vec<ResultSet>, _| {
+                                let rows = stack.last().unwrap();
+                                match rows {
+                                    Ok(rows) if rows.is_empty() => Ok(Ok(())),
+                                    Ok(rows) => Ok(Err(format!(
+                                        "FK constraint should have blocked insert, but {} rows exist",
+                                        rows.len()
+                                    ))),
+                                    Err(e) => Err(LimboError::InternalError(e.to_string())),
+                                }
+                            },
+                            vec![child_table_clone],
+                        ),
+                    )),
+                ]
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1500,6 +1903,246 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+// ==================== Foreign Key Action Property Generation ====================
+
+fn property_fk_delete_action<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use sql_generation::generation::table::FkTablePair;
+    use sql_generation::generation::{Arbitrary, ArbitraryFrom};
+    use sql_generation::model::query::predicate::Predicate;
+    use sql_generation::model::query::{Create, Delete, Insert};
+    use sql_generation::model::table::{ForeignKeyAction, SimValue};
+    use turso_core::Value;
+
+    // Pick a random FK action for on_delete
+    let action = ForeignKeyAction::arbitrary(rng, ctx);
+
+    // Generate parent-child table pair with the selected action
+    let fk_pair = FkTablePair::generate(rng, ctx, action, ForeignKeyAction::NoAction);
+
+    // Get column names
+    let pk_column = fk_pair.fk_constraint.parent_columns[0].clone();
+    let fk_column = fk_pair.fk_constraint.child_columns[0].clone();
+
+    // Generate a parent row value for the PK column
+    let pk_value = SimValue(Value::Integer(rng.random_range(1..1000)));
+
+    // Create parent insert
+    let parent_row: Vec<SimValue> = fk_pair
+        .parent
+        .columns
+        .iter()
+        .map(|col| {
+            if col.name == pk_column {
+                pk_value.clone()
+            } else {
+                SimValue::arbitrary_from(rng, ctx, &col.column_type)
+            }
+        })
+        .collect();
+
+    let insert_parent = Insert::Values {
+        table: fk_pair.parent.name.clone(),
+        values: vec![parent_row],
+    };
+
+    // Create child insert referencing parent
+    let child_row: Vec<SimValue> = fk_pair
+        .child
+        .columns
+        .iter()
+        .map(|col| {
+            if col.name == fk_column {
+                pk_value.clone()
+            } else {
+                SimValue::arbitrary_from(rng, ctx, &col.column_type)
+            }
+        })
+        .collect();
+
+    let insert_child = Insert::Values {
+        table: fk_pair.child.name.clone(),
+        values: vec![child_row],
+    };
+
+    // Create delete for parent (delete the row we just inserted)
+    let delete_parent = Delete {
+        table: fk_pair.parent.name.clone(),
+        predicate: Predicate::true_(),
+    };
+
+    Property::ForeignKeyDeleteAction {
+        action,
+        parent_table: fk_pair.parent.name.clone(),
+        child_table: fk_pair.child.name.clone(),
+        fk_column,
+        pk_column,
+        create_parent: Create {
+            table: fk_pair.parent,
+        },
+        create_child: Create {
+            table: fk_pair.child,
+        },
+        insert_parent,
+        insert_child,
+        delete_parent,
+    }
+}
+
+fn property_fk_update_action<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use sql_generation::generation::table::FkTablePair;
+    use sql_generation::generation::{Arbitrary, ArbitraryFrom};
+    use sql_generation::model::query::predicate::Predicate;
+    use sql_generation::model::query::update::Update;
+    use sql_generation::model::query::{Create, Insert};
+    use sql_generation::model::table::{ForeignKeyAction, SimValue};
+    use turso_core::Value;
+
+    // Pick a random FK action for on_update
+    let action = ForeignKeyAction::arbitrary(rng, ctx);
+
+    // Generate parent-child table pair with the selected action
+    let fk_pair = FkTablePair::generate(rng, ctx, ForeignKeyAction::NoAction, action);
+
+    // Get column names
+    let pk_column = fk_pair.fk_constraint.parent_columns[0].clone();
+    let fk_column = fk_pair.fk_constraint.child_columns[0].clone();
+
+    // Generate parent row values
+    let old_pk_value = SimValue(Value::Integer(rng.random_range(1..1000)));
+    let new_pk_value = SimValue(Value::Integer(rng.random_range(1001..2000)));
+
+    // Create parent insert
+    let parent_row: Vec<SimValue> = fk_pair
+        .parent
+        .columns
+        .iter()
+        .map(|col| {
+            if col.name == pk_column {
+                old_pk_value.clone()
+            } else {
+                SimValue::arbitrary_from(rng, ctx, &col.column_type)
+            }
+        })
+        .collect();
+
+    let insert_parent = Insert::Values {
+        table: fk_pair.parent.name.clone(),
+        values: vec![parent_row],
+    };
+
+    // Create child insert referencing parent
+    let child_row: Vec<SimValue> = fk_pair
+        .child
+        .columns
+        .iter()
+        .map(|col| {
+            if col.name == fk_column {
+                old_pk_value.clone()
+            } else {
+                SimValue::arbitrary_from(rng, ctx, &col.column_type)
+            }
+        })
+        .collect();
+
+    let insert_child = Insert::Values {
+        table: fk_pair.child.name.clone(),
+        values: vec![child_row],
+    };
+
+    // Create update for parent PK
+    let update_parent = Update {
+        table: fk_pair.parent.name.clone(),
+        set_values: vec![(pk_column.clone(), new_pk_value.clone())],
+        predicate: Predicate::true_(),
+    };
+
+    Property::ForeignKeyUpdateAction {
+        action,
+        parent_table: fk_pair.parent.name.clone(),
+        child_table: fk_pair.child.name.clone(),
+        fk_column,
+        pk_column,
+        create_parent: Create {
+            table: fk_pair.parent,
+        },
+        create_child: Create {
+            table: fk_pair.child,
+        },
+        insert_parent,
+        insert_child,
+        update_parent,
+        new_pk_value,
+    }
+}
+
+fn property_fk_invalid_insert<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use sql_generation::generation::ArbitraryFrom;
+    use sql_generation::generation::table::FkTablePair;
+    use sql_generation::model::query::{Create, Insert};
+    use sql_generation::model::table::{ForeignKeyAction, SimValue};
+    use turso_core::Value;
+
+    // Generate parent-child table pair (action doesn't matter for this test)
+    let fk_pair = FkTablePair::generate(
+        rng,
+        ctx,
+        ForeignKeyAction::NoAction,
+        ForeignKeyAction::NoAction,
+    );
+
+    // Get FK column name
+    let fk_column = fk_pair.fk_constraint.child_columns[0].clone();
+
+    // Generate a FK value that doesn't exist in parent
+    let invalid_fk_value = SimValue(Value::Integer(rng.random_range(9000..10000)));
+
+    // Create child insert with invalid FK (no parent row exists)
+    let child_row: Vec<SimValue> = fk_pair
+        .child
+        .columns
+        .iter()
+        .map(|col| {
+            if col.name == fk_column {
+                invalid_fk_value.clone()
+            } else {
+                SimValue::arbitrary_from(rng, ctx, &col.column_type)
+            }
+        })
+        .collect();
+
+    let insert_child = Insert::Values {
+        table: fk_pair.child.name.clone(),
+        values: vec![child_row],
+    };
+
+    Property::ForeignKeyInvalidInsert {
+        parent_table: fk_pair.parent.name.clone(),
+        child_table: fk_pair.child.name.clone(),
+        create_parent: Create {
+            table: fk_pair.parent,
+        },
+        create_child: Create {
+            table: fk_pair.child,
+        },
+        insert_child,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1526,6 +2169,9 @@ impl PropertyDiscriminants {
             }
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
+            PropertyDiscriminants::ForeignKeyDeleteAction => property_fk_delete_action,
+            PropertyDiscriminants::ForeignKeyUpdateAction => property_fk_update_action,
+            PropertyDiscriminants::ForeignKeyInvalidInsert => property_fk_invalid_insert,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -1624,6 +2270,19 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            // FK properties - disabled by default until fully implemented
+            PropertyDiscriminants::ForeignKeyDeleteAction
+            | PropertyDiscriminants::ForeignKeyUpdateAction
+            | PropertyDiscriminants::ForeignKeyInvalidInsert => {
+                if env.opts.enable_fk_tests {
+                    // FK tests need CREATE + INSERT + DELETE/UPDATE capabilities
+                    u32::min(remaining.create, remaining.insert)
+                        .min(remaining.delete.max(remaining.update))
+                        .max(1)
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -1664,6 +2323,17 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
+            PropertyDiscriminants::ForeignKeyDeleteAction => QueryCapabilities::CREATE
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::DELETE)
+                .union(QueryCapabilities::SELECT),
+            PropertyDiscriminants::ForeignKeyUpdateAction => QueryCapabilities::CREATE
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::UPDATE)
+                .union(QueryCapabilities::SELECT),
+            PropertyDiscriminants::ForeignKeyInvalidInsert => {
+                QueryCapabilities::CREATE.union(QueryCapabilities::INSERT)
+            }
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

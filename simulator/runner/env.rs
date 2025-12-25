@@ -693,6 +693,7 @@ impl SimulatorEnv {
                 .disable_union_all_preserves_cardinality,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
+            enable_fk_tests: cli_opts.enable_fk_tests,
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
             max_time_simulation: cli_opts.maximum_time,
@@ -829,13 +830,20 @@ impl SimulatorEnv {
                     conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
                         .expect("set pragma cache_size");
                 }
+                if self.opts.enable_fk_tests {
+                    conn.execute("PRAGMA foreign_keys = ON".to_string())
+                        .expect("enable foreign keys");
+                }
                 self.connections[connection_index] = SimConnection::LimboConnection(conn);
             }
             SimulationType::Differential => {
-                self.connections[connection_index] = SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(self.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                );
+                let conn = rusqlite::Connection::open(self.get_db_path())
+                    .expect("Failed to open SQLite connection");
+                if self.opts.enable_fk_tests {
+                    conn.execute("PRAGMA foreign_keys = ON", [])
+                        .expect("enable foreign keys");
+                }
+                self.connections[connection_index] = SimConnection::SQLiteConnection(conn);
             }
         };
     }
@@ -975,6 +983,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
     pub(crate) disable_integrity_check: bool,
+    pub(crate) enable_fk_tests: bool,
 
     pub(crate) max_interactions: u32,
     pub(crate) page_size: usize,

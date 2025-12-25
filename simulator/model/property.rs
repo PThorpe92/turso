@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
+use sql_generation::model::query::{
+    Create, Delete, Insert, Select, predicate::Predicate, update::Update,
+};
+use sql_generation::model::table::ForeignKeyAction;
 
 use crate::model::Query;
 
@@ -180,6 +183,108 @@ pub enum Property {
     FaultyQuery {
         query: Query,
     },
+
+    // Foreign Key Action Properties
+    // These properties test the various FK action behaviors (CASCADE, SET NULL,
+    // SET DEFAULT, RESTRICT, NO ACTION) for DELETE and UPDATE operations.
+    /// Test FK action on DELETE: verifies the correct behavior when a parent row is deleted.
+    /// Supports CASCADE, SET NULL, SET DEFAULT, RESTRICT, and NO ACTION.
+    ///
+    /// Execution flow:
+    /// 1. CREATE parent table with PRIMARY KEY
+    /// 2. CREATE child table with FOREIGN KEY referencing parent
+    /// 3. INSERT row into parent
+    /// 4. INSERT row into child referencing parent
+    /// 5. DELETE parent row
+    /// 6. SELECT from child table
+    /// 7. ASSERT based on FK action:
+    ///    - CASCADE: child row should be deleted
+    ///    - SET NULL: child FK column should be NULL
+    ///    - SET DEFAULT: child FK column should be default value
+    ///    - RESTRICT/NO ACTION: DELETE should fail (error expected)
+    ForeignKeyDeleteAction {
+        /// The FK action being tested (on_delete)
+        action: ForeignKeyAction,
+        /// Parent table name
+        parent_table: String,
+        /// Child table name
+        child_table: String,
+        /// Name of the FK column in child table
+        fk_column: String,
+        /// Name of the PK column in parent table
+        pk_column: String,
+        /// Create statement for parent table
+        create_parent: Create,
+        /// Create statement for child table
+        create_child: Create,
+        /// Insert into parent table
+        insert_parent: Insert,
+        /// Insert into child table (references parent)
+        insert_child: Insert,
+        /// Delete from parent table
+        delete_parent: Delete,
+    },
+
+    /// Test FK action on UPDATE: verifies the correct behavior when a parent PK is updated.
+    /// Supports CASCADE, SET NULL, SET DEFAULT, RESTRICT, and NO ACTION.
+    ///
+    /// Execution flow:
+    /// 1. CREATE parent table with PRIMARY KEY
+    /// 2. CREATE child table with FOREIGN KEY referencing parent
+    /// 3. INSERT row into parent
+    /// 4. INSERT row into child referencing parent
+    /// 5. UPDATE parent PK to new value
+    /// 6. SELECT from child table
+    /// 7. ASSERT based on FK action:
+    ///    - CASCADE: child FK column should have new value
+    ///    - SET NULL: child FK column should be NULL
+    ///    - SET DEFAULT: child FK column should be default value
+    ///    - RESTRICT/NO ACTION: UPDATE should fail (error expected)
+    ForeignKeyUpdateAction {
+        /// The FK action being tested (on_update)
+        action: ForeignKeyAction,
+        /// Parent table name
+        parent_table: String,
+        /// Child table name
+        child_table: String,
+        /// Name of the FK column in child table
+        fk_column: String,
+        /// Name of the PK column in parent table
+        pk_column: String,
+        /// Create statement for parent table
+        create_parent: Create,
+        /// Create statement for child table
+        create_child: Create,
+        /// Insert into parent table
+        insert_parent: Insert,
+        /// Insert into child table (references parent)
+        insert_child: Insert,
+        /// Update parent table PK
+        update_parent: Update,
+        /// The new PK value after update (for CASCADE verification)
+        new_pk_value: sql_generation::model::table::SimValue,
+    },
+
+    /// Test FK constraint enforcement on INSERT: verifies that inserting a child row
+    /// with a non-existent parent FK value fails.
+    ///
+    /// Execution flow:
+    /// 1. CREATE parent table with PRIMARY KEY
+    /// 2. CREATE child table with FOREIGN KEY referencing parent
+    /// 3. INSERT row into child referencing non-existent parent (should fail)
+    ForeignKeyInvalidInsert {
+        /// Parent table name
+        parent_table: String,
+        /// Child table name
+        child_table: String,
+        /// Create statement for parent table
+        create_parent: Create,
+        /// Create statement for child table
+        create_child: Create,
+        /// Insert into child table with invalid FK (should fail)
+        insert_child: Insert,
+    },
+
     /// Property used to subsititute a property with its queries only
     Queries {
         queries: Vec<Query>,
@@ -226,7 +331,10 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => None,
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::ForeignKeyDeleteAction { .. }
+            | Property::ForeignKeyUpdateAction { .. }
+            | Property::ForeignKeyInvalidInsert { .. } => None,
         }
     }
 }

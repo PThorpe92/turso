@@ -851,10 +851,13 @@ fn reopen_database(env: &mut SimulatorEnv) {
     match env.type_ {
         SimulationType::Differential => {
             for _ in 0..num_conns {
-                env.connections.push(SimConnection::SQLiteConnection(
-                    rusqlite::Connection::open(env.get_db_path())
-                        .expect("Failed to open SQLite connection"),
-                ));
+                let conn = rusqlite::Connection::open(env.get_db_path())
+                    .expect("Failed to open SQLite connection");
+                if env.opts.enable_fk_tests {
+                    conn.execute("PRAGMA foreign_keys = ON", [])
+                        .expect("enable foreign keys");
+                }
+                env.connections.push(SimConnection::SQLiteConnection(conn));
             }
         }
         SimulationType::Default | SimulationType::Doublecheck => {
@@ -887,9 +890,12 @@ fn reopen_database(env: &mut SimulatorEnv) {
             }
 
             for _ in 0..num_conns {
-                env.connections.push(SimConnection::LimboConnection(
-                    env.db.as_ref().expect("db to be Some").connect().unwrap(),
-                ));
+                let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
+                if env.opts.enable_fk_tests {
+                    conn.execute("PRAGMA foreign_keys = ON".to_string())
+                        .expect("enable foreign keys");
+                }
+                env.connections.push(SimConnection::LimboConnection(conn));
             }
         }
     };

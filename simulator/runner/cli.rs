@@ -145,6 +145,12 @@ pub struct SimulatorCLI {
     pub disable_fsync_no_wait: bool,
     #[clap(long, help = "disable FaultyQuery Property")]
     pub disable_faulty_query: bool,
+    #[clap(
+        long,
+        help = "Enable foreign key action tests (CASCADE, SET NULL, SET DEFAULT, RESTRICT, NO ACTION)",
+        default_value_t = false
+    )]
+    pub enable_fk_tests: bool,
     #[clap(long, help = "disable Reopen-Database fault")]
     pub disable_reopen_database: bool,
     #[clap(long = "latency-prob", help = "added IO latency probability", value_parser = clap::value_parser!(u8).range(0..=100))]
