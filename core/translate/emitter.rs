@@ -3516,6 +3516,25 @@ fn emit_update_insns<'a>(
                         target_pc: after_delete_label, // Skip if row doesn't exist
                     });
 
+                    // Read OLD values while cursor is positioned, for DELETE triggers
+                    let old_values = read_replace_delete_old_values(
+                        program,
+                        &t_ctx.resolver,
+                        &target_table,
+                        target_table_cursor_id,
+                        idx_rowid_reg,
+                        col_len,
+                    );
+
+                    // Fire BEFORE DELETE triggers for the implicit delete
+                    fire_replace_delete_triggers(
+                        program,
+                        &mut t_ctx.resolver,
+                        connection,
+                        &old_values,
+                        TriggerTime::Before,
+                    )?;
+
                     // Delete from ALL indexes for the conflicting row
                     // We must delete from all indexes, not just indexes_to_update,
                     // because the conflicting row may have entries in indexes
@@ -3558,6 +3577,15 @@ fn emit_update_insns<'a>(
                         table_name: table_name.to_string(),
                         is_part_of_update: false,
                     });
+
+                    // Fire AFTER DELETE triggers (using pre-read OLD values)
+                    fire_replace_delete_triggers(
+                        program,
+                        &mut t_ctx.resolver,
+                        connection,
+                        &old_values,
+                        TriggerTime::After,
+                    )?;
 
                     program.preassign_label_to_next_insn(after_delete_label);
 
@@ -3650,6 +3678,25 @@ fn emit_update_insns<'a>(
                         target_pc: after_delete_label, // Skip if row doesn't exist
                     });
 
+                    // Read OLD values while cursor is positioned, for DELETE triggers
+                    let old_values = read_replace_delete_old_values(
+                        program,
+                        &t_ctx.resolver,
+                        &target_table,
+                        target_table_cursor_id,
+                        target_reg,
+                        col_len,
+                    );
+
+                    // Fire BEFORE DELETE triggers for the implicit delete
+                    fire_replace_delete_triggers(
+                        program,
+                        &mut t_ctx.resolver,
+                        connection,
+                        &old_values,
+                        TriggerTime::Before,
+                    )?;
+
                     // Delete from ALL indexes for the conflicting row
                     // We must delete from all indexes, not just indexes_to_update,
                     // because the conflicting row may have entries in indexes
@@ -3692,6 +3739,15 @@ fn emit_update_insns<'a>(
                         table_name: table_name.to_string(),
                         is_part_of_update: false,
                     });
+
+                    // Fire AFTER DELETE triggers (using pre-read OLD values)
+                    fire_replace_delete_triggers(
+                        program,
+                        &mut t_ctx.resolver,
+                        connection,
+                        &old_values,
+                        TriggerTime::After,
+                    )?;
 
                     program.preassign_label_to_next_insn(after_delete_label);
                 }
@@ -4360,6 +4416,62 @@ fn rewrite_where_for_update_registers(
         }
         Ok(WalkControl::Continue)
     })
+}
+
+/// Read OLD column values from cursor for DELETE triggers during REPLACE conflict resolution.
+/// The cursor must already be positioned on the row being deleted.
+/// Returns Some(old_registers) if DELETE triggers exist, None otherwise.
+fn read_replace_delete_old_values(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    target_table: &Arc<JoinedTable>,
+    cursor_id: usize,
+    rowid_reg: usize,
+    col_len: usize,
+) -> Option<(Arc<BTreeTable>, Vec<usize>)> {
+    let btree_table = target_table.table.btree()?;
+    let has_delete_triggers =
+        has_relevant_triggers_type_only(resolver.schema, TriggerEvent::Delete, None, &btree_table);
+    if !has_delete_triggers {
+        return None;
+    }
+    let old_registers: Vec<usize> = (0..col_len)
+        .map(|i| {
+            let reg = program.alloc_register();
+            program.emit_column_or_rowid(cursor_id, i, reg);
+            reg
+        })
+        .chain(std::iter::once(rowid_reg))
+        .collect();
+    Some((btree_table, old_registers))
+}
+
+/// Fire DELETE triggers for implicit deletes caused by REPLACE conflict resolution.
+/// `old_values` should be the result from `read_replace_delete_old_values`.
+fn fire_replace_delete_triggers(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<Connection>,
+    old_values: &Option<(Arc<BTreeTable>, Vec<usize>)>,
+    time: TriggerTime,
+) -> crate::Result<()> {
+    if let Some((btree_table, old_registers)) = old_values {
+        let triggers = get_relevant_triggers_type_and_time(
+            resolver.schema,
+            TriggerEvent::Delete,
+            time,
+            None,
+            btree_table,
+        );
+        if triggers.clone().count() > 0 {
+            let trigger_ctx =
+                TriggerContext::new(btree_table.clone(), None, Some(old_registers.clone()));
+            for trigger in triggers {
+                fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.

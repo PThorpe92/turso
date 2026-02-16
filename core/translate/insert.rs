@@ -2846,11 +2846,76 @@ fn emit_replace_delete_conflicting_row(
     ctx: &mut InsertEmitCtx,
     table_references: &mut TableReferences,
 ) -> Result<()> {
+    let skip_delete_label = program.allocate_label();
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
         src_reg: ctx.conflict_rowid_reg,
-        target_pc: ctx.halt_label,
+        target_pc: skip_delete_label,
     });
+
+    let table = Arc::clone(ctx.table);
+    let table_name = table.name.as_str();
+    let main_cursor_id = ctx.cursor_id;
+    let cols_len = table.columns.len();
+
+    // Check for DELETE triggers on this table.
+    let has_before_delete_triggers = get_relevant_triggers_type_and_time(
+        resolver.schema,
+        TriggerEvent::Delete,
+        TriggerTime::Before,
+        None,
+        &table,
+    )
+    .count()
+        > 0;
+    let has_after_delete_triggers = get_relevant_triggers_type_and_time(
+        resolver.schema,
+        TriggerEvent::Delete,
+        TriggerTime::After,
+        None,
+        &table,
+    )
+    .count()
+        > 0;
+    let has_delete_triggers = has_before_delete_triggers || has_after_delete_triggers;
+
+    // Read OLD column values for triggers (must happen while cursor is on the conflicting row).
+    let old_registers = if has_delete_triggers {
+        let old_regs: Vec<usize> = (0..cols_len)
+            .map(|i| {
+                let reg = program.alloc_register();
+                program.emit_column_or_rowid(main_cursor_id, i, reg);
+                reg
+            })
+            .chain(std::iter::once(ctx.conflict_rowid_reg))
+            .collect();
+        Some(old_regs)
+    } else {
+        None
+    };
+
+    // Fire BEFORE DELETE triggers.
+    if has_before_delete_triggers {
+        let triggers = get_relevant_triggers_type_and_time(
+            resolver.schema,
+            TriggerEvent::Delete,
+            TriggerTime::Before,
+            None,
+            &table,
+        );
+        let trigger_ctx = TriggerContext::new(Arc::clone(&table), None, old_registers.clone());
+        for trigger in triggers {
+            fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
+        }
+
+        // BEFORE DELETE triggers may have altered the btree, re-seek the row.
+        // If the row was deleted by the trigger, skip the rest.
+        program.emit_insn(Insn::NotExists {
+            cursor: main_cursor_id,
+            rowid_reg: ctx.conflict_rowid_reg,
+            target_pc: skip_delete_label,
+        });
+    }
 
     // OR REPLACE + foreign keys:
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for the row being deleted.
@@ -2859,23 +2924,19 @@ fn emit_replace_delete_conflicting_row(
         fire_fk_delete_actions(
             program,
             resolver,
-            ctx.table.name.as_str(),
+            table_name,
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
             connection,
         )?;
     }
 
-    let table = &ctx.table;
-    let table_name = table.name.as_str();
-    let main_cursor_id = ctx.cursor_id;
-
     for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
         let index = resolver
             .schema
             .get_index(table_name, name)
             .expect("index to exist");
-        let skip_delete_label = if index.where_clause.is_some() {
+        let skip_idx_delete_label = if index.where_clause.is_some() {
             let where_copy = index
                 .bind_where_expr(Some(table_references), connection)
                 .expect("where clause to exist");
@@ -2940,7 +3001,7 @@ fn emit_replace_delete_conflicting_row(
             raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
 
-        if let Some(label) = skip_delete_label {
+        if let Some(label) = skip_idx_delete_label {
             program.resolve_label(label, program.offset());
         }
     }
@@ -2975,6 +3036,22 @@ fn emit_replace_delete_conflicting_row(
         table_name: table_name.to_string(),
         is_part_of_update: true,
     });
+
+    if has_after_delete_triggers {
+        let triggers = get_relevant_triggers_type_and_time(
+            resolver.schema,
+            TriggerEvent::Delete,
+            TriggerTime::After,
+            None,
+            &table,
+        );
+        let trigger_ctx = TriggerContext::new(Arc::clone(&table), None, old_registers);
+        for trigger in triggers {
+            fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
+        }
+    }
+
+    program.preassign_label_to_next_insn(skip_delete_label);
     Ok(())
 }
 
