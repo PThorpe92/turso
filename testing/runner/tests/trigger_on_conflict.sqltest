@@ -243,11 +243,11 @@ expect {
 # Per SQLite docs: "When the REPLACE conflict resolution strategy deletes rows
 # in order to satisfy a constraint, delete triggers fire if and only if
 # recursive triggers are enabled."
-# By default recursive_triggers is OFF, so DELETE triggers should NOT fire.
 # =============================================================================
 
-# Test: INSERT OR REPLACE should fire INSERT trigger but NOT DELETE trigger (by default)
-test insert-or-replace-no-delete-trigger-by-default {
+# Test: INSERT OR REPLACE fires both DELETE and INSERT triggers
+# BEFORE INSERT fires before constraint check, then BEFORE DELETE fires during REPLACE
+test insert-or-replace-fires-delete-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
     CREATE TRIGGER trg_before_delete BEFORE DELETE ON t1 BEGIN
@@ -263,6 +263,99 @@ test insert-or-replace-no-delete-trigger-by-default {
 expect {
     insert trigger: original
     insert trigger: replaced
+    delete trigger: original
+}
+
+# Test: INSERT OR REPLACE fires AFTER DELETE trigger with correct OLD values
+test insert-or-replace-after-delete-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_after_delete AFTER DELETE ON t1 BEGIN
+        INSERT INTO log VALUES ('deleted id=' || OLD.id || ' val=' || OLD.val);
+    END;
+    CREATE TRIGGER trg_after_insert AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES ('inserted id=' || NEW.id);
+    END;
+    INSERT INTO t1 VALUES (1, 50);
+    DELETE FROM log;
+    REPLACE INTO t1 VALUES (1, 99);
+    SELECT * FROM log ORDER BY rowid;
+    SELECT * FROM t1;
+}
+expect {
+    deleted id=1 val=50
+    inserted id=1
+    1|99
+}
+
+# Test: INSERT OR REPLACE with no conflict does not fire DELETE trigger
+test insert-or-replace-no-conflict-no-delete-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_delete AFTER DELETE ON t1 BEGIN
+        INSERT INTO log VALUES ('deleted');
+    END;
+    CREATE TRIGGER trg_insert AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES ('inserted');
+    END;
+    INSERT OR REPLACE INTO t1 VALUES (1, 'first');
+    SELECT * FROM log;
+}
+expect {
+    inserted
+}
+
+# Test: INSERT OR REPLACE with UNIQUE index conflict fires DELETE trigger
+test insert-or-replace-unique-conflict-fires-delete-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT UNIQUE);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_delete AFTER DELETE ON t1 BEGIN
+        INSERT INTO log VALUES ('deleted id=' || OLD.id || ' val=' || OLD.val);
+    END;
+    INSERT INTO t1 VALUES (1, 'alice');
+    INSERT OR REPLACE INTO t1 VALUES (2, 'alice');
+    SELECT * FROM log;
+    SELECT * FROM t1;
+}
+expect {
+    deleted id=1 val=alice
+    2|alice
+}
+
+# Test: UPDATE OR REPLACE fires DELETE trigger on rowid conflict
+test update-or-replace-rowid-fires-delete-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, name TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_delete AFTER DELETE ON t1 BEGIN
+        INSERT INTO log VALUES ('deleted id=' || OLD.id || ' name=' || OLD.name);
+    END;
+    INSERT INTO t1 VALUES (1, 50, 'alice');
+    INSERT INTO t1 VALUES (2, 60, 'bob');
+    UPDATE OR REPLACE t1 SET id = 2 WHERE id = 1;
+    SELECT * FROM log;
+    SELECT * FROM t1;
+}
+expect {
+    deleted id=2 name=bob
+    2|50|alice
+}
+
+# Test: UPDATE OR REPLACE fires DELETE trigger on UNIQUE index conflict
+test update-or-replace-unique-fires-delete-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER UNIQUE, name TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_delete AFTER DELETE ON t1 BEGIN
+        INSERT INTO log VALUES ('deleted id=' || OLD.id || ' val=' || OLD.val);
+    END;
+    INSERT INTO t1 VALUES (1, 10, 'alice');
+    INSERT INTO t1 VALUES (2, 20, 'bob');
+    UPDATE OR REPLACE t1 SET val = 20 WHERE id = 1;
+    SELECT * FROM log;
+    SELECT * FROM t1;
+}
+expect {
+    deleted id=2 val=20
+    1|20|alice
 }
 
 # =============================================================================

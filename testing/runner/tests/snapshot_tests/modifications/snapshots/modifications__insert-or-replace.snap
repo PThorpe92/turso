@@ -30,7 +30,7 @@ addr  opcode         p1  p2  p3  p4                p5  comment
   13  Affinity        3   4   0                     0  r[3..7] = D, B, B, B
   14  NotExists       1  22   2                     0
   15  Copy            2   1   0                     0  r[1]=r[2]
-  16  SeekRowid       1   1  41                     0  if (r[1]!=cursor 1 for table users.rowid) goto 41
+  16  SeekRowid       1   1  21                     0  if (r[1]!=cursor 1 for table users.rowid) goto 21
   17  Column          1   1   8                     0  r[8]=users.email
   18  Copy            1   9   0                     0  r[9]=r[1]
   19  IdxDelete       0   8   2                     1
@@ -41,7 +41,7 @@ addr  opcode         p1  p2  p3  p4                p5  comment
   24  Affinity       10   1   0                     0  r[10..11] = B
   25  NoConflict      0  33  10  1                  0  key=r[10..10]
   26  IdxRowId        0   1   0                     0  r[1]=cursor 0.rowid
-  27  SeekRowid       1   1  41                     0  if (r[1]!=cursor 1 for table users.rowid) goto 41
+  27  SeekRowid       1   1  32                     0  if (r[1]!=cursor 1 for table users.rowid) goto 32
   28  Column          1   1  12                     0  r[12]=users.email
   29  Copy            1  13   0                     0  r[13]=r[1]
   30  IdxDelete       0  12   2                     1

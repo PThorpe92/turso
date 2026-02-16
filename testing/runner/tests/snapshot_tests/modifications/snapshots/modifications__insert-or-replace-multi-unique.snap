@@ -31,7 +31,7 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   14  Affinity        3   4   0                  0  r[3..7] = D, B, B, B
   15  NotExists       2  26   2                  0
   16  Copy            2   1   0                  0  r[1]=r[2]
-  17  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
+  17  SeekRowid       2   1  25                  0  if (r[1]!=cursor 2 for table items.rowid) goto 25
   18  Column          2   2   8                  0  r[8]=items.barcode
   19  Copy            1   9   0                  0  r[9]=r[1]
   20  IdxDelete       0   8   2                  1
@@ -45,7 +45,7 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   28  Affinity       12   1   0                  0  r[12..13] = B
   29  NoConflict      0  40  12  1               0  key=r[12..12]
   30  IdxRowId        0   1   0                  0  r[1]=cursor 0.rowid
-  31  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
+  31  SeekRowid       2   1  39                  0  if (r[1]!=cursor 2 for table items.rowid) goto 39
   32  Column          2   2  14                  0  r[14]=items.barcode
   33  Copy            1  15   0                  0  r[15]=r[1]
   34  IdxDelete       0  14   2                  1
@@ -61,7 +61,7 @@ addr  opcode         p1  p2  p3  p4             p5  comment
   44  Affinity       19   1   0                  0  r[19..20] = B
   45  NoConflict      1  56  19  1               0  key=r[19..19]
   46  IdxRowId        1   1   0                  0  r[1]=cursor 1.rowid
-  47  SeekRowid       2   1  64                  0  if (r[1]!=cursor 2 for table items.rowid) goto 64
+  47  SeekRowid       2   1  55                  0  if (r[1]!=cursor 2 for table items.rowid) goto 55
   48  Column          2   2  21                  0  r[21]=items.barcode
   49  Copy            1  22   0                  0  r[22]=r[1]
   50  IdxDelete       0  21   2                  1
