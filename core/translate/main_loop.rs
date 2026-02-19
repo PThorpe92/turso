@@ -2195,13 +2195,13 @@ fn emit_loop_source<'a>(
 /// Closes the loop for a given source operator.
 /// For example in the case of a nested table scan, this means emitting the Next instruction
 /// for all tables involved, innermost first.
-pub fn close_loop(
+pub fn close_loop<'a>(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
+    t_ctx: &mut TranslateCtx<'a>,
     tables: &TableReferences,
     join_order: &[JoinOrderMember],
     mode: OperationMode,
-    select_plan: Option<&SelectPlan>,
+    select_plan: Option<&'a SelectPlan>,
 ) -> Result<()> {
     // We close the loops for all tables in reverse order, i.e. innermost first.
     // OPEN t1
