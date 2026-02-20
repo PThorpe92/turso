@@ -153,6 +153,10 @@ clickbench:
 build-release: check-rust-version
 	cargo build --bin tursodb --release --features=tracing_release
 
+fuzz:
+	cargo test -p core_tester --release -- fuzz
+.PHONY: fuzz
+
 bench-exclude-tpc-h:
 	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \
 	if [ -z "$$benchmarks" ]; then \
