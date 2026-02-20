@@ -3,7 +3,6 @@ CURRENT_RUST_VERSION := $(shell rustc -V | sed -E 's/rustc ([0-9]+\.[0-9]+\.[0-9
 CURRENT_RUST_TARGET := $(shell rustc -vV | grep host | cut -d ' ' -f 2)
 RUSTUP := $(shell command -v rustup 2> /dev/null)
 UNAME_S := $(shell uname -s)
-MINIMUM_TCL_VERSION := 8.6
 
 # Executable used to execute the compatibility tests.
 SQLITE_EXEC ?= scripts/limbo-sqlite3
@@ -31,17 +30,6 @@ check-rust-version:
 		echo "Rust version $(CURRENT_RUST_VERSION) is acceptable."; \
 	fi
 .PHONY: check-rust-version
-
-check-tcl-version:
-	@printf '%s\n' \
-		'set need "$(MINIMUM_TCL_VERSION)"' \
-		'set have [info patchlevel]' \
-		'if {[package vcompare $$have $$need] < 0} {' \
-		'    puts stderr "tclsh $$have found — need $$need+"' \
-		'    exit 1' \
-		'}' \
-	| tclsh
-.PHONY: check-tcl-version
 
 build: check-rust-version
 	cargo build
@@ -81,18 +69,6 @@ test-extensions: build uv-sync-test
 test-shell: build uv-sync-test
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --project limbo_test test-shell
 .PHONY: test-shell
-
-test-compat: check-tcl-version
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/system/all.test
-
-test-single: check-tcl-version
-	@if [ -z "$(TEST)" ]; then \
-		echo "Usage: make test-single TEST=path/to/test.test"; \
-		exit 1; \
-	fi
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/system/$(TEST)
-.PHONY: test-single
-.PHONY: test-compat
 
 reset-db:
 	./scripts/clone_test_db.sh
