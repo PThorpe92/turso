@@ -1145,7 +1145,11 @@ pub fn compute_best_join_order<'a>(
     let left_join_illegal_map = {
         let left_join_count = joined_tables
             .iter()
-            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer))
+            .filter(|t| {
+                t.join_info
+                    .as_ref()
+                    .is_some_and(|j| j.outer || j.right_outer)
+            })
             .count();
         if left_join_count == 0 {
             None
@@ -1155,8 +1159,29 @@ pub fn compute_best_join_order<'a>(
                 HashMap::with_capacity_and_hasher(left_join_count, Default::default());
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
+                    if joined_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|j| j.outer || j.right_outer)
+                    {
                         // bitwise OR the masks
+                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
+                            illegal_lhs.add_table(j);
+                        } else {
+                            let mut mask = TableMask::new();
+                            mask.add_table(j);
+                            left_join_illegal_map.insert(i, mask);
+                        }
+                    }
+                }
+            }
+            // RIGHT JOIN ordering: tables after a right_outer table in the
+            // original FROM clause must also come after it in the join order.
+            // This ensures the Gosub/Return pattern can wrap inner loops that
+            // follow the right table.
+            for (i, table_i) in joined_tables.iter().enumerate() {
+                if table_i.join_info.as_ref().is_some_and(|j| j.right_outer) {
+                    for j in (i + 1)..joined_tables.len() {
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
                             illegal_lhs.add_table(j);
                         } else {
@@ -1225,7 +1250,7 @@ pub fn compute_best_join_order<'a>(
                             is_outer: joined_tables[table_no]
                                 .join_info
                                 .as_ref()
-                                .is_some_and(|j| j.outer),
+                                .is_some_and(|j| j.outer || j.right_outer),
                         });
                     }
                     join_order.push(JoinOrderMember {
@@ -1234,7 +1259,7 @@ pub fn compute_best_join_order<'a>(
                         is_outer: joined_tables[rhs_idx]
                             .join_info
                             .as_ref()
-                            .is_some_and(|j| j.outer),
+                            .is_some_and(|j| j.outer || j.right_outer),
                     });
                     turso_assert_eq!(join_order.len(), subset_size);
 
@@ -1526,7 +1551,10 @@ pub fn compute_greedy_join_order<'a>(
             let last = join_order.last_mut().unwrap();
             last.table_id = table.internal_id;
             last.original_idx = idx;
-            last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.outer);
+            last.is_outer = table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.outer || ji.right_outer);
 
             if let Some(plan) = join_lhs_and_rhs(
                 current_plan.as_ref(),
@@ -1565,7 +1593,10 @@ pub fn compute_greedy_join_order<'a>(
         join_order.push(JoinOrderMember {
             table_id: next_table.internal_id,
             original_idx: next_idx,
-            is_outer: next_table.join_info.as_ref().is_some_and(|ji| ji.outer),
+            is_outer: next_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.outer || ji.right_outer),
         });
         remaining.retain(|&x| x != next_idx);
         current_plan = Some(next_plan);
@@ -1668,7 +1699,10 @@ pub fn compute_naive_left_deep_plan<'a>(
         .map(|(i, t)| JoinOrderMember {
             table_id: t.internal_id,
             original_idx: i,
-            is_outer: t.join_info.as_ref().is_some_and(|j| j.outer),
+            is_outer: t
+                .join_info
+                .as_ref()
+                .is_some_and(|j| j.outer || j.right_outer),
         })
         .collect::<Vec<_>>();
 
@@ -2097,6 +2131,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2221,6 +2256,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2230,6 +2266,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2433,6 +2470,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2442,6 +2480,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2558,6 +2597,7 @@ mod tests {
                     Some(JoinInfo {
                         outer: false,
                         full_outer: false,
+                        right_outer: false,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2568,6 +2608,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2830,6 +2871,8 @@ mod tests {
                 Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
             ),
             from_outer_join: None,
+            from_inner_join_on: false,
+            deferred_past_right_join: None,
             consumed: false,
         }];
 
@@ -2946,6 +2989,8 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join_on: false,
+                deferred_past_right_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -2960,6 +3005,8 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join_on: false,
+                deferred_past_right_join: None,
                 consumed: false,
             },
         ];
@@ -3081,6 +3128,8 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(5.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join_on: false,
+                deferred_past_right_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -3095,6 +3144,8 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(10.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join_on: false,
+                deferred_past_right_join: None,
                 consumed: false,
             },
             WhereTerm {
@@ -3109,6 +3160,8 @@ mod tests {
                     Box::new(Expr::Literal(ast::Literal::Numeric(7.to_string()))),
                 ),
                 from_outer_join: None,
+                from_inner_join_on: false,
+                deferred_past_right_join: None,
                 consumed: false,
             },
         ];
@@ -3249,6 +3302,8 @@ mod tests {
         WhereTerm {
             expr: Expr::Binary(Box::new(lhs), op, Box::new(rhs)),
             from_outer_join: None,
+            from_inner_join_on: false,
+            deferred_past_right_join: None,
             consumed: false,
         }
     }
@@ -3297,6 +3352,7 @@ mod tests {
                 Some(JoinInfo {
                     outer: false,
                     full_outer: false,
+                    right_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),

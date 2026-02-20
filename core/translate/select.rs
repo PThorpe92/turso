@@ -798,6 +798,8 @@ fn add_vtab_predicates_to_where_clause(
         plan.where_clause.push(WhereTerm {
             expr,
             from_outer_join,
+            from_inner_join_on: false,
+            deferred_past_right_join: None,
             consumed: false,
         });
     }

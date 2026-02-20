@@ -1297,9 +1297,10 @@ pub fn parse_where(
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
                 break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve from_outer_join from the original term
+                // Preserve from_outer_join and from_inner_join_on from the original term
                 for new_term in new_terms.iter_mut() {
                     new_term.from_outer_join = term.from_outer_join;
+                    new_term.from_inner_join_on = term.from_inner_join_on;
                 }
                 let count = new_terms.len();
                 for (j, new_term) in new_terms.into_iter().enumerate() {
@@ -1330,6 +1331,17 @@ pub fn determine_where_to_eval_term(
     table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
     if let Some(table_id) = term.from_outer_join {
+        return Ok(EvalAt::Loop(
+            join_order
+                .iter()
+                .position(|t| t.table_id == table_id)
+                .unwrap_or(usize::MAX),
+        ));
+    }
+
+    // Conditions deferred past a RIGHT JOIN are forced to evaluate at the
+    // RIGHT JOIN table's loop level, after RowSetAdd has been recorded.
+    if let Some(table_id) = term.deferred_past_right_join {
         return Ok(EvalAt::Loop(
             join_order
                 .iter()
@@ -1645,7 +1657,7 @@ fn parse_join(
         connection,
     )?;
 
-    let (outer, natural, full_outer) = match join_operator {
+    let (outer, natural, full_outer, right_outer) = match join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
             if join_type.contains(JoinType::CROSS) {
                 crate::bail_parse_error!("CROSS JOIN is not supported");
@@ -1658,32 +1670,39 @@ fn parse_join(
             let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
 
             if is_right && !is_left && !is_full {
-                // RIGHT JOIN -> swap last two table entries, treat as LEFT JOIN.
-                // The rightmost table (just added) becomes the left side, and vice versa.
-                let len = table_references.joined_tables().len();
-                // The swap is only correct when the two tables being swapped are
-                // the only tables in the FROM clause. When prior joins exist
-                // (len > 2), swapping would move tables to positions where their
-                // ON clause conditions reference tables that haven't been scanned.
-                if len > 2 {
-                    crate::bail_parse_error!(
-                        "RIGHT JOIN following another join is not yet supported. \
-                         Try rewriting as LEFT JOIN or using a subquery."
-                    );
-                }
-                table_references.joined_tables_mut().swap(len - 2, len - 1);
-                // The outer flag goes on the table that was originally on the left
-                // (now in the rightmost position after swap), this is correct because
-                // JoinInfo.outer marks the table whose columns become NULL on miss.
-                (true, is_natural, false)
+                // Native RIGHT JOIN: set right_outer on the preserved (right) table.
+                // Left-side tables get NULLed for unmatched right rows via RowSet scan.
+                (false, is_natural, false, true)
             } else if is_full {
-                (true, is_natural, true)
+                (true, is_natural, true, false)
             } else {
-                (is_outer || is_left, is_natural, false)
+                (is_outer || is_left, is_natural, false, false)
             }
         }
-        _ => (false, false, false),
+        _ => (false, false, false, false),
     };
+
+    if right_outer {
+        // RIGHT JOIN after LEFT or FULL OUTER is not yet supported: the LEFT/FULL OUTER
+        // unmatched row emission doesn't properly interact with RIGHT JOIN RowSet tracking.
+        for prev_table in table_references.joined_tables().iter() {
+            if let Some(ji) = &prev_table.join_info {
+                if ji.outer || ji.full_outer {
+                    crate::bail_parse_error!(
+                        "RIGHT JOIN following a LEFT or FULL OUTER JOIN is not yet supported"
+                    );
+                }
+            }
+        }
+        // RIGHT JOIN requires RowId-based tracking (RowSet) for the right-side table.
+        // Coroutine-based subqueries don't have rowids, so this combination is unsupported.
+        let right_table = table_references.joined_tables().last().unwrap();
+        if matches!(right_table.table, Table::FromClauseSubquery(_)) {
+            crate::bail_parse_error!(
+                "RIGHT JOIN with a subquery on the right side is not yet supported"
+            );
+        }
+    }
 
     if natural && constraint.is_some() {
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
@@ -1754,11 +1773,14 @@ fn parse_join(
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
-                    predicate.from_outer_join = if outer {
+                    predicate.from_outer_join = if outer || right_outer {
                         Some(table_references.joined_tables().last().unwrap().internal_id)
                     } else {
                         None
                     };
+                    // Mark inner join ON conditions so they're excluded from
+                    // RIGHT JOIN unmatched scans (analogous to SQLite's EP_InnerON).
+                    predicate.from_inner_join_on = !outer && !right_outer;
                     bind_and_rewrite_expr(
                         &mut predicate.expr,
                         Some(table_references),
@@ -1840,11 +1862,13 @@ fn parse_join(
                     right_table.mark_column_used(right_col_idx);
                     out_where_clause.push(WhereTerm {
                         expr,
-                        from_outer_join: if outer {
+                        from_outer_join: if outer || right_outer {
                             Some(right_table.internal_id)
                         } else {
                             None
                         },
+                        from_inner_join_on: !outer && !right_outer,
+                        deferred_past_right_join: None,
                         consumed: false,
                     });
                 }
@@ -1862,6 +1886,7 @@ fn parse_join(
     rightmost_table.join_info = Some(JoinInfo {
         outer,
         full_outer,
+        right_outer,
         using,
     });
 

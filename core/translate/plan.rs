@@ -143,6 +143,20 @@ pub struct WhereTerm {
     /// right-side table of the OUTER JOIN (in this case, s). When evaluating conditions, if [WhereTerm::from_outer_join]
     /// is set, we force evaluation to happen during that table's loop.
     pub from_outer_join: Option<TableInternalId>,
+    /// Whether this condition originated from an INNER JOIN's ON clause.
+    /// Inner join ON is semantically equivalent to WHERE for inner joins,
+    /// but must NOT be re-evaluated during a RIGHT JOIN's unmatched scan.
+    /// In the unmatched scan, left-side cursors are NullRow'd, so inner
+    /// join ON conditions like `t1.c = t2.c` become `NULL = NULL → NULL`,
+    /// which would incorrectly filter out unmatched rows.
+    /// Analogous to SQLite's EP_InnerON flag.
+    pub from_inner_join_on: bool,
+    /// When set, forces this condition to be evaluated at the specified table's
+    /// loop level instead of its natural level. Used when a WHERE condition on
+    /// left-side tables must be deferred past a RIGHT JOIN to avoid filtering
+    /// the hash build input (which would prevent RowSet population).
+    /// Unlike `from_outer_join`, this does NOT use LEFT JOIN evaluation semantics.
+    pub deferred_past_right_join: Option<TableInternalId>,
     /// Whether the condition has been consumed by the optimizer in some way, and it should not be evaluated
     /// in the normal place where WHERE terms are evaluated.
     /// A term may have been consumed e.g. if:
@@ -198,6 +212,8 @@ impl From<Expr> for WhereTerm {
         Self {
             expr: value,
             from_outer_join: None,
+            from_inner_join_on: false,
+            deferred_past_right_join: None,
             consumed: false,
         }
     }
@@ -674,6 +690,10 @@ pub struct JoinInfo {
     pub outer: bool,
     /// Whether this is a FULL OUTER JOIN (implies outer = true).
     pub full_outer: bool,
+    /// Whether this is a RIGHT OUTER JOIN.
+    /// Set on the table written after the RIGHT JOIN keyword (the preserved side).
+    /// Left-side tables get NULLed on non-match.
+    pub right_outer: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
 }

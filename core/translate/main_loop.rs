@@ -60,6 +60,29 @@ pub struct LeftJoinMetadata {
     pub label_match_flag_check_value: BranchOffset,
 }
 
+/// Metadata for handling RIGHT JOIN operations.
+/// Unlike LEFT JOIN which uses a per-row match flag, RIGHT JOIN needs global
+/// tracking across all outer iterations to know which right-table rows were
+/// never matched by any left row.
+#[derive(Debug)]
+pub struct RightJoinMetadata {
+    /// Register holding the RowSet of matched rowids from the right table.
+    pub rowset_reg: usize,
+    /// Temp register for reading rowid during the unmatched scan.
+    pub rowid_reg: usize,
+    /// Label for the start of the unmatched row scan loop.
+    pub label_unmatched_start: BranchOffset,
+    /// Label for the end of the unmatched row scan (done).
+    pub label_unmatched_done: BranchOffset,
+    /// Register for Gosub/Return when inner loops (tables after the right table)
+    /// are wrapped in a subroutine for re-entry from the unmatched scan.
+    pub inner_loop_gosub_reg: Option<usize>,
+    /// Label for the inner loop subroutine entry point.
+    pub inner_loop_gosub_label: Option<BranchOffset>,
+    /// Label to skip over the inner loop subroutine body.
+    pub inner_loop_skip_label: Option<BranchOffset>,
+}
+
 /// Jump labels for each loop in the query's main execution loop
 #[derive(Debug, Clone, Copy)]
 pub struct LoopLabels {
@@ -179,6 +202,26 @@ pub fn init_loop(
                     label_match_flag_check_value: program.allocate_label(),
                 };
                 t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
+            }
+            if join_info.right_outer {
+                let rowset_reg = program.alloc_register();
+                let rowid_reg = program.alloc_register();
+                // Initialize the RowSet register to NULL; the RowSet is
+                // created implicitly on first RowSetAdd.
+                program.emit_insn(Insn::Null {
+                    dest: rowset_reg,
+                    dest_end: None,
+                });
+                let rj_metadata = RightJoinMetadata {
+                    rowset_reg,
+                    rowid_reg,
+                    label_unmatched_start: program.allocate_label(),
+                    label_unmatched_done: program.allocate_label(),
+                    inner_loop_gosub_reg: None,
+                    inner_loop_gosub_label: None,
+                    inner_loop_skip_label: None,
+                };
+                t_ctx.meta_right_joins[table_index] = Some(rj_metadata);
             }
         }
         let (table_cursor_id, index_cursor_id) =
@@ -710,6 +753,14 @@ fn emit_hash_build_phase(
         let build_only_mask =
             TableMask::from_table_number_iter([hash_join_op.build_table_idx].into_iter());
         for cond in predicates.iter() {
+            // Skip consumed conditions (e.g. conditions marked consumed in
+            // a materialization sub-plan to avoid filtering during build).
+            // Also skip conditions deferred past a RIGHT JOIN — they must
+            // not filter the build scan because every build row needs to
+            // be inserted into the hash table so RowSetAdd can track matches.
+            if cond.consumed || cond.deferred_past_right_join.is_some() {
+                continue;
+            }
             let mask =
                 table_mask_from_expr(&cond.expr, table_references, non_from_clause_subqueries)?;
             if !mask.contains_table(hash_join_op.build_table_idx)
@@ -1708,6 +1759,32 @@ pub fn open_loop(
             }
         }
 
+        // RIGHT JOIN: record the right table's rowid as matched in the RowSet.
+        if let Some(join_info) = table.join_info.as_ref() {
+            if join_info.right_outer {
+                if let Some(rj_meta) = t_ctx.meta_right_joins[joined_table_index].as_ref() {
+                    // Use IdxRowId when only an index cursor is available (e.g. ephemeral auto-index).
+                    if let Some(cursor_id) = table_cursor_id {
+                        program.emit_insn(Insn::RowId {
+                            cursor_id,
+                            dest: rj_meta.rowid_reg,
+                        });
+                    } else {
+                        let cursor_id = index_cursor_id
+                            .expect("RIGHT JOIN table must have a table or index cursor");
+                        program.emit_insn(Insn::IdxRowId {
+                            cursor_id,
+                            dest: rj_meta.rowid_reg,
+                        });
+                    }
+                    program.emit_insn(Insn::RowSetAdd {
+                        rowset_reg: rj_meta.rowset_reg,
+                        value_reg: rj_meta.rowid_reg,
+                    });
+                }
+            }
+        }
+
         // Outer hash joins: mark hash entry as matched, set FULL OUTER match flag.
         if let Operation::HashJoin(ref hj) = table.op {
             if matches!(
@@ -1806,6 +1883,33 @@ pub fn open_loop(
                     hash_ctx.inner_loop_gosub_reg = Some(return_reg);
                     hash_ctx.inner_loop_gosub_label = Some(gosub_label);
                     hash_ctx.inner_loop_skip_label = Some(skip_label);
+                }
+            }
+        }
+
+        // RIGHT JOIN: wrap subsequent inner table loops in a Gosub/Return
+        // subroutine so the unmatched row scan can re-enter them.
+        // Only needed when there are tables after the right-joined table.
+        if let Some(join_info) = table.join_info.as_ref() {
+            if join_info.right_outer && join_index < join_order.len() - 1 {
+                let return_reg = program.alloc_register();
+                let gosub_label = program.allocate_label();
+                let skip_label = program.allocate_label();
+
+                program.emit_insn(Insn::Gosub {
+                    target_pc: gosub_label,
+                    return_reg,
+                });
+                program.emit_insn(Insn::Goto {
+                    target_pc: skip_label,
+                });
+                // Subroutine body starts here (inner loops follow)
+                program.preassign_label_to_next_insn(gosub_label);
+
+                if let Some(rj_meta) = t_ctx.meta_right_joins[joined_table_index].as_mut() {
+                    rj_meta.inner_loop_gosub_reg = Some(return_reg);
+                    rj_meta.inner_loop_gosub_label = Some(gosub_label);
+                    rj_meta.inner_loop_skip_label = Some(skip_label);
                 }
             }
         }
@@ -2218,6 +2322,26 @@ pub fn close_loop<'a>(
             .labels_main_loop
             .get(table_index)
             .expect("source has no loop labels");
+
+        // RIGHT JOIN: close the inner loop subroutine BEFORE the right table's
+        // own loop-closing instructions. All inner loops have already been closed
+        // (we iterate in reverse order), so the Return terminates the Gosub body
+        // without including the right table's Next/HashNext/loop_end.
+        if let Some(join_info) = table.join_info.as_ref() {
+            if join_info.right_outer {
+                if let Some(rj_meta) = t_ctx.meta_right_joins[table_index].as_ref() {
+                    if let Some(gosub_reg) = rj_meta.inner_loop_gosub_reg {
+                        program.emit_insn(Insn::Return {
+                            return_reg: gosub_reg,
+                            can_fallthrough: false,
+                        });
+                        if let Some(skip_label) = rj_meta.inner_loop_skip_label {
+                            program.preassign_label_to_next_insn(skip_label);
+                        }
+                    }
+                }
+            }
+        }
 
         let (table_cursor_id, index_cursor_id) = table.resolve_cursors(program, mode.clone())?;
         match &table.op {
@@ -2693,6 +2817,293 @@ pub fn close_loop<'a>(
         }
     }
 
+    // RIGHT JOIN: scan for unmatched right-table rows and emit them with NULLs
+    // for the left side. This must happen after all loops are closed.
+    if let Some(plan) = select_plan {
+        for join in join_order.iter() {
+            let table_index = join.original_idx;
+            let table = &tables.joined_tables()[table_index];
+            let is_right_outer = table.join_info.as_ref().is_some_and(|ji| ji.right_outer);
+            if !is_right_outer {
+                continue;
+            }
+            let rj_meta = t_ctx.meta_right_joins[table_index]
+                .as_ref()
+                .expect("RIGHT JOIN table must have right join metadata");
+            // Copy values from rj_meta to avoid holding an immutable borrow on t_ctx
+            // across the mutable borrow needed by emit_loop.
+            let rowset_reg = rj_meta.rowset_reg;
+            let rowid_reg = rj_meta.rowid_reg;
+            let label_unmatched_start = rj_meta.label_unmatched_start;
+            let label_unmatched_done = rj_meta.label_unmatched_done;
+            let gosub_reg = rj_meta.inner_loop_gosub_reg;
+            let gosub_label = rj_meta.inner_loop_gosub_label;
+
+            let (right_table_cursor, right_index_cursor) =
+                table.resolve_cursors(program, mode.clone())?;
+
+            // When the right table has an ephemeral auto-index, result column
+            // expressions may read from the index cursor (e.g. IdxRowId) rather
+            // than the table cursor. Use the index cursor for scanning so those
+            // references stay valid; fall back to the table cursor otherwise.
+            let (scan_cursor_id, use_idx_rowid) = if let Some(idx_cursor) = right_index_cursor {
+                (idx_cursor, true)
+            } else if let Some(tbl_cursor) = right_table_cursor {
+                (tbl_cursor, false)
+            } else {
+                unreachable!("RIGHT JOIN table must have a table or index cursor")
+            };
+
+            // Ensure all ephemeral auto-index cursors in the RIGHT JOIN scope
+            // are opened. Auto-indexes in the main loop are behind Once blocks
+            // that may never execute if inner joins produce no matching rows.
+            // The unmatched scan needs these cursors to be valid for NullRow,
+            // IdxRowId, Rewind, etc.
+            let all_table_indices: Vec<usize> = {
+                let mut indices = vec![table_index];
+                for (idx, _) in tables.joined_tables().iter().enumerate() {
+                    if idx < table_index {
+                        indices.push(idx);
+                    }
+                }
+                indices
+            };
+            for &tbl_idx in &all_table_indices {
+                let tbl = &tables.joined_tables()[tbl_idx];
+                let index = tbl.op.index();
+                if let Some(index) = index {
+                    if index.ephemeral {
+                        let (tbl_cursor, idx_cursor) =
+                            tbl.resolve_cursors(program, mode.clone())?;
+                        if let (Some(tbl_cursor_id), Some(idx_cursor_id)) = (tbl_cursor, idx_cursor)
+                        {
+                            let has_rowid =
+                                matches!(&tbl.table, Table::BTree(btree) if btree.has_rowid);
+                            ensure_autoindex_for_unmatched_scan(
+                                program,
+                                index,
+                                tbl_cursor_id,
+                                idx_cursor_id,
+                                has_rowid,
+                            )?;
+                        }
+                    }
+                }
+            }
+
+            let label_next_unmatched = program.allocate_label();
+
+            // Rewind the scan cursor to iterate all right-table rows.
+            program.emit_insn(Insn::Rewind {
+                cursor_id: scan_cursor_id,
+                pc_if_empty: label_unmatched_done,
+            });
+
+            program.preassign_label_to_next_insn(label_unmatched_start);
+
+            // Get the current rowid (IdxRowId for index cursors, RowId for table).
+            if use_idx_rowid {
+                program.emit_insn(Insn::IdxRowId {
+                    cursor_id: scan_cursor_id,
+                    dest: rowid_reg,
+                });
+            } else {
+                program.emit_insn(Insn::RowId {
+                    cursor_id: scan_cursor_id,
+                    dest: rowid_reg,
+                });
+            }
+
+            // Check if this rowid was matched. RowSetTest with batch=-1 means
+            // check-only (no insert). If found, skip to next row.
+            program.emit_insn(Insn::RowSetTest {
+                rowset_reg,
+                pc_if_found: label_next_unmatched,
+                value_reg: rowid_reg,
+                batch: -1,
+            });
+
+            // When scanning an index cursor, also position the table cursor
+            // so inner loops can read column values via Column. The index
+            // only stores the indexed columns + rowid; the Gosub subroutine
+            // reads from the table cursor for non-indexed columns.
+            if use_idx_rowid {
+                if let Some(tbl_cursor) = right_table_cursor {
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: tbl_cursor,
+                        src_reg: rowid_reg,
+                        target_pc: label_next_unmatched,
+                    });
+                }
+            }
+
+            // NullRow only the left-side cursors (tables at original index < right
+            // table's index). Tables after the right table may participate in
+            // subsequent inner/left joins and will be re-entered via Gosub.
+            for left_join in join_order.iter() {
+                let left_idx = left_join.original_idx;
+                if left_idx >= table_index {
+                    continue;
+                }
+                let left_table = &tables.joined_tables()[left_idx];
+                let (left_table_cursor, left_index_cursor) =
+                    left_table.resolve_cursors(program, mode.clone())?;
+                if let Some(cursor_id) = left_table_cursor {
+                    program.emit_insn(Insn::NullRow { cursor_id });
+                }
+                if let Some(cursor_id) = left_index_cursor {
+                    program.emit_insn(Insn::NullRow { cursor_id });
+                }
+                // Null out subquery result registers for left-side subquery tables.
+                if let Table::FromClauseSubquery(from_clause_subquery) = &left_table.table {
+                    if let Some(start_reg) = from_clause_subquery.result_columns_start_reg {
+                        let column_count = from_clause_subquery.columns.len();
+                        if column_count > 0 {
+                            program.emit_insn(Insn::Null {
+                                dest: start_reg,
+                                dest_end: Some(start_reg + column_count - 1),
+                            });
+                        }
+                    }
+                }
+                // If this left-side table is a hash-join probe, clear the build-side
+                // hash registers too. During unmatched RIGHT JOIN emission, result
+                // columns may read from these cached payload registers instead of a
+                // cursor, so they must be explicitly NULLed.
+                if let Operation::HashJoin(ref hj) = left_table.op {
+                    if let Some(hash_ctx) = t_ctx.hash_table_contexts.get(&hj.build_table_idx) {
+                        if let Some(cursor_id) = hash_ctx.build_cursor_id {
+                            program.emit_insn(Insn::NullRow { cursor_id });
+                        }
+                        program.emit_insn(Insn::Null {
+                            dest: hash_ctx.match_reg,
+                            dest_end: None,
+                        });
+                        if let Some(payload_reg) = hash_ctx.payload_start_reg {
+                            let num_payload = hash_ctx.payload_columns.len();
+                            if num_payload > 0 {
+                                program.emit_insn(Insn::Null {
+                                    dest: payload_reg,
+                                    dest_end: Some(payload_reg + num_payload - 1),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If the right table uses a hash join, NullRow the build cursor and
+            // null out hash registers so emit_loop reads NULLs.
+            if let Operation::HashJoin(ref hj) = table.op {
+                if let Some(hash_ctx) = t_ctx.hash_table_contexts.get(&hj.build_table_idx) {
+                    if let Some(cursor_id) = hash_ctx.build_cursor_id {
+                        program.emit_insn(Insn::NullRow { cursor_id });
+                    }
+                    // Build-table rowid aliases can be cached to match_reg.
+                    // Clear it so unmatched RIGHT JOIN rows don't leak stale ids.
+                    program.emit_insn(Insn::Null {
+                        dest: hash_ctx.match_reg,
+                        dest_end: None,
+                    });
+                    if let Some(payload_reg) = hash_ctx.payload_start_reg {
+                        let num_payload = hash_ctx.payload_columns.len();
+                        if num_payload > 0 {
+                            program.emit_insn(Insn::Null {
+                                dest: payload_reg,
+                                dest_end: Some(payload_reg + num_payload - 1),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Evaluate true WHERE conditions (not ON) on the unmatched right row.
+            // Left-side cursors are NullRow'd, so any WHERE referencing left columns
+            // evaluates to NULL (falsy), which is correct SQL semantics.
+            // When a Gosub wraps inner loops, only evaluate conditions referencing
+            // left/right tables (inner table conditions are handled by the Gosub).
+            let has_gosub = gosub_reg.is_some() && gosub_label.is_some();
+            let allowed_tables = {
+                let mut m = TableMask::new();
+                m.add_table(table_index);
+                // Add hash join build table if applicable
+                if let Operation::HashJoin(ref hj) = table.op {
+                    m.add_table(hj.build_table_idx);
+                }
+                // Add ALL left-side tables (original_idx < right table's index),
+                // not just those in the pruned join order. Materialized prefix
+                // tables are removed from the join order but their columns are
+                // available via hash probe payload registers (NullRow'd in the
+                // unmatched scan). Tables after the right table are part of the
+                // Gosub subroutine and should not be evaluated outside it.
+                for (idx, _) in tables.joined_tables().iter().enumerate() {
+                    if idx < table_index {
+                        m.add_table(idx);
+                    }
+                }
+                m
+            };
+            // Note: we intentionally ignore `c.consumed` here. In the main loop,
+            // consumed conditions are handled by the access method (e.g. index seek).
+            // But the unmatched scan doesn't use the main loop's access method —
+            // left-side cursors are NullRow'd, and the right table is scanned via
+            // Rewind/Next. So consumed conditions must be re-evaluated to ensure
+            // proper NULL filtering.
+            //
+            // We also skip conditions with `from_inner_join_on` — these are ON
+            // conditions from inner joins between left-side tables (e.g. t1.c = t2.c
+            // in `t1 JOIN t2 ON t1.c = t2.c RIGHT JOIN t3`). These conditions were
+            // already used during the main loop's join logic and must not be
+            // re-evaluated here where both sides are NullRow'd (NULL = NULL → NULL
+            // would incorrectly filter out unmatched rows).
+            // Analogous to SQLite's EP_InnerON handling.
+            for cond in plan
+                .where_clause
+                .iter()
+                .filter(|c| c.from_outer_join.is_none())
+                .filter(|c| !c.from_inner_join_on)
+                .filter(|c| {
+                    !has_gosub
+                        || expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)
+                })
+            {
+                let jump_target_when_true = program.allocate_label();
+                let condition_metadata = ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true,
+                    jump_target_when_false: label_next_unmatched,
+                    jump_target_when_null: label_next_unmatched,
+                };
+                translate_condition_expr(
+                    program,
+                    &plan.table_references,
+                    &cond.expr,
+                    condition_metadata,
+                    &t_ctx.resolver,
+                )?;
+                program.preassign_label_to_next_insn(jump_target_when_true);
+            }
+
+            // Emit the result row via Gosub (re-enters inner loops) or emit_loop.
+            if let (Some(gosub_reg), Some(gosub_label)) = (gosub_reg, gosub_label) {
+                program.emit_insn(Insn::Gosub {
+                    target_pc: gosub_label,
+                    return_reg: gosub_reg,
+                });
+            } else {
+                emit_loop(program, t_ctx, plan)?;
+            }
+
+            program.resolve_label(label_next_unmatched, program.offset());
+            program.emit_insn(Insn::Next {
+                cursor_id: scan_cursor_id,
+                pc_if_next: label_unmatched_start,
+            });
+
+            program.preassign_label_to_next_insn(label_unmatched_done);
+        }
+    }
+
     // After ALL loops are closed, emit HashClose for any hash tables that were built.
     // This must happen at the very end because hash join probe loops may be nested
     // inside outer loops that re-enter them. Hash tables used by materialization
@@ -3115,6 +3526,67 @@ fn emit_seek_termination(
 
 struct AutoIndexResult {
     use_bloom_filter: bool,
+}
+
+/// Ensure an ephemeral auto-index cursor is built (populated) before the
+/// RIGHT JOIN unmatched scan. Auto-indexes in the main loop are behind a
+/// `Once` block that may never execute if inner joins produce no matches.
+/// The unmatched scan needs these cursors to be valid (for Rewind, NullRow,
+/// IdxRowId, etc.), so we emit a second `Once`-guarded build here. If the
+/// main loop already built the auto-index, this clears and rebuilds it
+/// (redundant but correct); if not, it creates the auto-index fresh.
+fn ensure_autoindex_for_unmatched_scan(
+    program: &mut ProgramBuilder,
+    index: &Arc<Index>,
+    table_cursor_id: CursorID,
+    index_cursor_id: CursorID,
+    table_has_rowid: bool,
+) -> Result<()> {
+    let label_end = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: label_end,
+    });
+    program.emit_insn(Insn::OpenAutoindex {
+        cursor_id: index_cursor_id,
+    });
+    let label_loop_start = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: table_cursor_id,
+        pc_if_empty: label_loop_start,
+    });
+    program.preassign_label_to_next_insn(label_loop_start);
+    let num_regs = index.columns.len() + table_has_rowid as usize;
+    let cols_start_reg = program.alloc_registers(num_regs);
+    for (i, col) in index.columns.iter().enumerate() {
+        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, cols_start_reg + i);
+    }
+    if table_has_rowid {
+        program.emit_insn(Insn::RowId {
+            cursor_id: table_cursor_id,
+            dest: cols_start_reg + index.columns.len(),
+        });
+    }
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(cols_start_reg),
+        count: to_u16(num_regs),
+        dest_reg: to_u16(record_reg),
+        index_name: Some(index.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: index_cursor_id,
+        record_reg,
+        unpacked_start: Some(cols_start_reg),
+        unpacked_count: Some(num_regs as u16),
+        flags: IdxInsertFlags::new().use_seek(false),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: table_cursor_id,
+        pc_if_next: label_loop_start,
+    });
+    program.preassign_label_to_next_insn(label_end);
+    Ok(())
 }
 
 /// Open an ephemeral index cursor and build an automatic index on a table.

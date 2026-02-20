@@ -20,6 +20,7 @@ use super::group_by::{
 };
 use super::main_loop::{
     close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
+    RightJoinMetadata,
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
@@ -418,6 +419,9 @@ pub struct TranslateCtx<'a> {
     /// mapping between table loop index and associated metadata (for left joins only)
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// mapping between table loop index and associated metadata (for right joins)
+    /// this metadata exists for the table written after the RIGHT JOIN keyword (the preserved side)
+    pub meta_right_joins: Vec<Option<RightJoinMetadata>>,
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
@@ -454,6 +458,7 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_right_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),
             materialized_build_inputs: HashMap::default(),
@@ -536,12 +541,81 @@ fn build_rowid_column() -> Column {
     Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
 }
 
+/// Defer pure WHERE conditions on build-side tables of RIGHT JOIN hash
+/// joins to the probe table's loop level. Without this, the conditions
+/// filter the hash build and prevent RowSet population for matched rows.
+///
+/// For materialized builds, this is handled in
+/// `build_materialized_build_input_plan` and
+/// `prune_join_order_for_materialized_inputs`. This function handles the
+/// non-materialized case (single-table builds without a prefix).
+fn defer_where_conditions_past_right_join_builds(plan: &mut SelectPlan) -> Result<()> {
+    // Collect (left_side_mask, right_table_internal_id) for each RIGHT JOIN.
+    // This works for both hash join and NLJ paths — any WHERE condition that
+    // references only left-side tables must be deferred past the RIGHT JOIN
+    // so that RowSetAdd can track all matches before WHERE filtering.
+    let mut right_join_build_masks: Vec<(TableMask, TableInternalId)> = Vec::new();
+    for member in plan.join_order.iter() {
+        let table = &plan.table_references.joined_tables()[member.original_idx];
+        let is_right_join = table.join_info.as_ref().is_some_and(|ji| ji.right_outer);
+        if is_right_join {
+            // Build mask of all tables left of the RIGHT JOIN table.
+            let mut left_mask = TableMask::new();
+            if let Operation::HashJoin(hash_join_op) = &table.op {
+                left_mask.add_table(hash_join_op.build_table_idx);
+            }
+            // Include every table syntactically to the left of the RIGHT JOIN
+            // table, not just tables still present in join_order. Hash-build
+            // tables can be removed from join_order but still appear in WHERE
+            // terms via cached payload registers.
+            for (other_idx, _) in plan.table_references.joined_tables().iter().enumerate() {
+                if other_idx < member.original_idx {
+                    left_mask.add_table(other_idx);
+                }
+            }
+            right_join_build_masks.push((left_mask, table.internal_id));
+        }
+    }
+    if right_join_build_masks.is_empty() {
+        return Ok(());
+    }
+
+    for term in plan.where_clause.iter_mut() {
+        if term.consumed
+            || term.from_outer_join.is_some()
+            || term.from_inner_join_on
+            || term.deferred_past_right_join.is_some()
+        {
+            continue;
+        }
+        let mask = table_mask_from_expr(
+            &term.expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        // Check if this condition references only build-side tables of a RIGHT JOIN.
+        for &(ref build_mask, probe_id) in &right_join_build_masks {
+            if build_mask.contains_all(&mask) && !mask.is_empty() {
+                term.deferred_past_right_join = Some(probe_id);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn emit_program_for_select_with_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut plan: SelectPlan,
     materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
+    // For non-materialized hash builds that feed RIGHT JOINs, defer pure
+    // WHERE conditions on build-side tables to the probe table's loop level.
+    // Without this, the conditions filter the hash build and prevent RowSet
+    // population for matched right-table rows.
+    defer_where_conditions_past_right_join_builds(&mut plan)?;
+
     let mut t_ctx = TranslateCtx::new(
         program,
         resolver.fork(),
@@ -841,20 +915,33 @@ fn prune_join_order_for_materialized_inputs(
     }
 
     let mut build_tables_in_plan = HashSet::default();
+    // Collect RIGHT JOIN probe table ids for each build table.
+    let mut right_join_probe_table_ids: HashMap<usize, TableInternalId> = HashMap::default();
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
             build_tables_in_plan.insert(hash_join_op.build_table_idx);
+            // Check if this hash join feeds a RIGHT JOIN.
+            if table.join_info.as_ref().is_some_and(|ji| ji.right_outer) {
+                right_join_probe_table_ids.insert(hash_join_op.build_table_idx, table.internal_id);
+            }
         }
     }
 
     let mut tables_to_remove: HashSet<usize> = HashSet::default();
+    // Track which prefix tables belong to a RIGHT JOIN build.
+    let mut right_join_prefix_tables: HashMap<usize, TableInternalId> = HashMap::default();
     for (build_table_idx, input) in build_inputs.iter() {
         if !build_tables_in_plan.contains(build_table_idx) {
             continue;
         }
         if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
             tables_to_remove.extend(input.prefix_tables.iter().copied());
+            if let Some(&probe_id) = right_join_probe_table_ids.get(build_table_idx) {
+                for &prefix_table in &input.prefix_tables {
+                    right_join_prefix_tables.insert(prefix_table, probe_id);
+                }
+            }
         }
     }
 
@@ -863,6 +950,12 @@ fn prune_join_order_for_materialized_inputs(
     }
 
     let prefix_mask = TableMask::from_table_number_iter(tables_to_remove.iter().copied());
+    // Build a mask of tables in RIGHT JOIN prefixes for efficient lookup.
+    let right_join_prefix_mask = if !right_join_prefix_tables.is_empty() {
+        TableMask::from_table_number_iter(right_join_prefix_tables.keys().copied())
+    } else {
+        TableMask::new()
+    };
     for term in plan.where_clause.iter_mut() {
         if term.consumed {
             continue;
@@ -873,6 +966,27 @@ fn prune_join_order_for_materialized_inputs(
             &plan.non_from_clause_subqueries,
         )?;
         if prefix_mask.contains_all(&mask) {
+            // For pure WHERE conditions that reference only RIGHT JOIN prefix
+            // tables, defer to the probe table's loop instead of consuming.
+            // This ensures the condition is evaluated after RowSetAdd, not
+            // during the hash build (where it would incorrectly filter rows
+            // and prevent RowSet population).
+            if !right_join_prefix_mask.is_empty()
+                && right_join_prefix_mask.contains_all(&mask)
+                && term.from_outer_join.is_none()
+                && !term.from_inner_join_on
+            {
+                // Find the probe table id from any of the referenced tables.
+                // All tables in the mask are in the same RIGHT JOIN prefix.
+                if let Some(&probe_id) = right_join_prefix_tables
+                    .iter()
+                    .find(|(&table_idx, _)| mask.contains_table(table_idx))
+                    .map(|(_, id)| id)
+                {
+                    term.deferred_past_right_join = Some(probe_id);
+                    continue;
+                }
+            }
             term.consumed = true;
         }
     }
@@ -1049,6 +1163,20 @@ fn build_materialized_build_input_plan(
     // set when deciding which WHERE terms can be evaluated inside the materialization.
     let eval_prefix_mask = TableMask::from_table_number_iter(included_tables.iter().copied());
 
+    // Check if this hash join feeds a RIGHT JOIN — either the probe table
+    // itself has right_outer, OR any downstream table in the join order does.
+    // For chained hash joins (t1→t2→t3→t4 where t4 is RIGHT JOIN), the first
+    // materialization (t1→t2) has probe=t3 which isn't right_outer, but t4 is.
+    // We must still consume WHERE conditions to avoid filtering build rows.
+    let is_right_join = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .any(|(idx, t)| {
+            idx >= probe_table_idx && t.join_info.as_ref().is_some_and(|ji| ji.right_outer)
+        });
+
     // Clone WHERE terms but mark as "consumed" any term that needs tables
     // outside the prefix. This prevents the subplan from trying to evaluate
     // predicates it doesn't have access to (e.g. autoindex lookups that
@@ -1064,6 +1192,20 @@ fn build_materialized_build_input_plan(
         // Preserve consumed terms that the optimizer already suppressed, and
         // additionally consume any term that depends on tables outside the prefix.
         term.consumed |= outside_prefix;
+
+        // For RIGHT JOINs: also consume pure WHERE conditions that reference
+        // only prefix tables. These must NOT filter the build input because
+        // doing so would prevent RowSet population for right-table rows that
+        // should match. These conditions will be deferred to the probe table's
+        // loop level in prune_join_order_for_materialized_inputs.
+        if is_right_join
+            && !term.consumed
+            && term.from_outer_join.is_none()
+            && !term.from_inner_join_on
+            && eval_prefix_mask.contains_all(&mask)
+        {
+            term.consumed = true;
+        }
     }
 
     // Clone table references and then "sanitize" each access method so that

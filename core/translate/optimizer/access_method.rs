@@ -827,7 +827,7 @@ pub fn try_hash_join_access_method(
     if build_table
         .join_info
         .as_ref()
-        .is_some_and(|ji| ji.outer || ji.full_outer)
+        .is_some_and(|ji| ji.outer || ji.full_outer || ji.right_outer)
     {
         return None;
     }

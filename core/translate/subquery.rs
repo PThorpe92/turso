@@ -1203,6 +1203,9 @@ pub fn emit_from_clause_subquery(
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
@@ -1300,6 +1303,9 @@ fn emit_materialized_cte(
                 meta_left_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
                 meta_sort: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
@@ -1385,6 +1391,9 @@ fn emit_indexed_materialized_subquery(
                 label_main_loop_end: None,
                 meta_group_by: None,
                 meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_right_joins: (0..select_plan.joined_tables().len())
                     .map(|_| None)
                     .collect(),
                 meta_sort: None,
