@@ -1052,7 +1052,7 @@ test right-then-full-outer-chain-errors {
     FULL OUTER JOIN t3 ON t2.b = t3.c;
 }
 expect error {
-    FULL OUTER JOIN chaining is not yet supported
+    FULL OUTER JOIN requires an equality condition in the ON clause
 }
 
 # RIGHT JOIN with aggregate functions and NULL propagation.
@@ -1156,25 +1156,29 @@ test left-then-right-join-chain-errors {
     RIGHT JOIN t3 ON t2.b = t3.c;
 }
 expect error {
-    RIGHT JOIN following another join is not yet supported
+    RIGHT JOIN following a LEFT or FULL OUTER JOIN is not yet supported
 }
 
-@skip-if sqlite "supported in sqlite"
-test right-then-right-join-chain-errors {
+test right-then-right-join-chain {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
     CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (3), (4);
     SELECT t1.a, t2.b, t3.c
     FROM t1
     RIGHT JOIN t2 ON t1.a = t2.b
-    RIGHT JOIN t3 ON t2.b = t3.c;
+    RIGHT JOIN t3 ON t2.b = t3.c
+    ORDER BY t3.c;
 }
-expect error {
-    RIGHT JOIN following another join is not yet supported
+expect {
+    |3|3
+    ||4
 }
 
-# FULL OUTER then RIGHT JOIN should also error — RIGHT after FULL OUTER
-# means len > 2 at the time of the RIGHT JOIN swap.
+# FULL OUTER then RIGHT JOIN should error — the unmatched row emission
+# from FULL OUTER doesn't properly interact with RIGHT JOIN RowSet tracking.
 @skip-if sqlite "supported in sqlite"
 test full-outer-then-right-join-errors {
     CREATE TABLE t1(a);
@@ -1186,7 +1190,29 @@ test full-outer-then-right-join-errors {
     RIGHT JOIN t3 ON t2.b = t3.c;
 }
 expect error {
-    RIGHT JOIN following another join is not yet supported
+    RIGHT JOIN following a LEFT or FULL OUTER JOIN is not yet supported
+}
+
+# RIGHT JOIN USING is intentionally unsupported for now.
+@skip-if sqlite "supported in sqlite"
+test right-join-using-errors {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, c);
+    SELECT * FROM t1 RIGHT JOIN t2 USING(a);
+}
+expect error {
+    RIGHT JOIN with USING is not yet supported
+}
+
+# NATURAL RIGHT JOIN is intentionally unsupported for now.
+@skip-if sqlite "supported in sqlite"
+test natural-right-join-errors {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, c);
+    SELECT * FROM t1 NATURAL RIGHT JOIN t2;
+}
+expect error {
+    RIGHT JOIN with NATURAL is not yet supported
 }
 
 # FULL OUTER where ON condition uses expressions on both sides.

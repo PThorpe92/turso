@@ -1,0 +1,87 @@
+@database :memory:
+
+# Regressions for mixed join chains that previously produced incorrect rows.
+
+test join-chain-inner-const-then-left-on-right-input {
+    CREATE TABLE t1(id INT, a INT);
+    CREATE TABLE t2(id INT, a INT);
+    CREATE TABLE t3(id INT, a INT);
+
+    INSERT INTO t1 VALUES (1, 1), (2, 2);
+    INSERT INTO t2 VALUES (10, 1), (11, 2);
+    INSERT INTO t3 VALUES (20, 1);
+
+    SELECT t1.id, t2.id, t3.id
+    FROM t1 JOIN t2 ON 1
+    LEFT JOIN t3 ON t2.a = t3.a
+    ORDER BY t1.id, t2.id, t3.id;
+}
+expect {
+    1|10|20
+    1|11|
+    2|10|20
+    2|11|
+}
+
+test join-chain-inner-const-then-left-on-left-input {
+    CREATE TABLE t1(id INT, a INT);
+    CREATE TABLE t2(id INT, x INT);
+    CREATE TABLE t3(id INT, a INT);
+
+    INSERT INTO t1 VALUES (1, 1), (2, 2);
+    INSERT INTO t2 VALUES (10, 100), (11, 200);
+    INSERT INTO t3 VALUES (20, 1);
+
+    SELECT t1.id, t2.id, t3.id
+    FROM t1 JOIN t2 ON 1
+    LEFT JOIN t3 ON t1.a = t3.a
+    ORDER BY t1.id, t2.id, t3.id;
+}
+expect {
+    1|10|20
+    1|11|20
+    2|10|
+    2|11|
+}
+
+test join-chain-inner-const-then-full-on-right-input {
+    CREATE TABLE t1(id INT, a INT);
+    CREATE TABLE t2(id INT, a INT);
+    CREATE TABLE t3(id INT, a INT);
+
+    INSERT INTO t1 VALUES (1, 1), (2, 2);
+    INSERT INTO t2 VALUES (10, 1), (11, 2);
+    INSERT INTO t3 VALUES (20, 1), (21, 3);
+
+    SELECT t1.id, t2.id, t3.id
+    FROM t1 JOIN t2 ON 1
+    FULL OUTER JOIN t3 ON t2.a = t3.a
+    ORDER BY t1.id, t2.id, t3.id;
+}
+expect {
+    ||21
+    1|10|20
+    1|11|
+    2|10|20
+    2|11|
+}
+
+test join-chain-comma-cross-then-left {
+    CREATE TABLE t1(id INT, a INT);
+    CREATE TABLE t2(id INT, a INT);
+    CREATE TABLE t3(id INT, a INT);
+
+    INSERT INTO t1 VALUES (1, 1), (2, 2);
+    INSERT INTO t2 VALUES (10, 1), (11, 2);
+    INSERT INTO t3 VALUES (20, 1);
+
+    SELECT t1.id, t2.id, t3.id
+    FROM t1, t2 LEFT JOIN t3 ON t2.a = t3.a
+    ORDER BY t1.id, t2.id, t3.id;
+}
+expect {
+    1|10|20
+    1|11|
+    2|10|20
+    2|11|
+}

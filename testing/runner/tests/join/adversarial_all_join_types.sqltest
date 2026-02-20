@@ -1,0 +1,492 @@
+@database :memory:
+
+# Broad adversarial coverage across inner/left/right/full/comma/natural/using join behavior.
+
+setup base_join_data {
+    CREATE TABLE a1(id INT, k INT, x TEXT, y INT);
+    CREATE TABLE a2(id INT, k INT, x TEXT, y INT);
+    CREATE TABLE a3(id INT, k INT, x TEXT, y INT);
+    INSERT INTO a1 VALUES
+        (1,1,'a',10),(2,2,'b',20),(3,NULL,'c',20),(4,4,'d',NULL),(5,2,'e',25);
+    INSERT INTO a2 VALUES
+        (10,1,'a',10),(11,2,'bb',99),(12,3,'c',20),(13,NULL,'n',20),(14,5,'e',50),(15,2,'b',20);
+    INSERT INTO a3 VALUES
+        (20,1,'p',10),(21,2,'q',20),(22,5,'r',50),(23,NULL,'s',20),(24,2,'t',25);
+}
+
+setup natural_join_data {
+    CREATE TABLE n1(a INT, b INT, c TEXT);
+    CREATE TABLE n2(a INT, b INT, d TEXT);
+    CREATE TABLE n3(a INT, b INT, e TEXT);
+    INSERT INTO n1 VALUES (1,10,'x'),(2,20,'y'),(3,NULL,'z'),(4,40,'w');
+    INSERT INTO n2 VALUES (1,10,'p'),(2,99,'q'),(3,NULL,'r'),(5,50,'s');
+    INSERT INTO n3 VALUES (1,10,'m'),(2,20,'n'),(5,50,'o');
+}
+
+# ============================================================
+# INNER / comma joins
+# ============================================================
+
+@setup base_join_data
+test adv-inner-three-way-y-equality {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1 JOIN a2 ON a1.k=a2.k JOIN a3 ON a2.y=a3.y
+    ORDER BY 1,2,3;
+}
+expect {
+    1|10|20
+    2|15|21
+    2|15|23
+    5|15|21
+    5|15|23
+}
+
+@setup base_join_data
+test adv-inner-using-multi-col {
+    SELECT t1.id,t2.id,k,y
+    FROM a1 t1 JOIN a2 t2 USING(k,y)
+    ORDER BY t1.id,t2.id;
+}
+expect {
+    1|10|1|10
+    2|15|2|20
+}
+
+@setup base_join_data
+test adv-inner-self-join-nontrivial {
+    SELECT l.id,r.id
+    FROM a2 l JOIN a2 r ON l.k=r.k AND l.id<r.id
+    ORDER BY 1,2;
+}
+expect {
+    11|15
+}
+
+@setup base_join_data
+test adv-comma-plus-left-precedence {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1, a2 LEFT JOIN a3 ON a2.k=a3.k
+    WHERE a1.k=2
+    ORDER BY 1,2,3;
+}
+expect {
+    2|10|20
+    2|11|21
+    2|11|24
+    2|12|
+    2|13|
+    2|14|22
+    2|15|21
+    2|15|24
+    5|10|20
+    5|11|21
+    5|11|24
+    5|12|
+    5|13|
+    5|14|22
+    5|15|21
+    5|15|24
+}
+
+# ============================================================
+# LEFT joins
+# ============================================================
+
+@setup base_join_data
+test adv-left-on-filter-keeps-unmatched {
+    SELECT a1.id,a2.id
+    FROM a1 LEFT JOIN a2 ON a1.k=a2.k AND a2.y=20
+    ORDER BY a1.id,a2.id;
+}
+expect {
+    1|
+    2|15
+    3|
+    4|
+    5|15
+}
+
+@setup base_join_data
+test adv-left-where-filter-converts-to-inner {
+    SELECT a1.id,a2.id
+    FROM a1 LEFT JOIN a2 ON a1.k=a2.k
+    WHERE a2.y=20
+    ORDER BY a1.id,a2.id;
+}
+expect {
+    2|15
+    5|15
+}
+
+@setup base_join_data
+test adv-left-chain-dependent-condition {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1
+    LEFT JOIN a2 ON a1.k=a2.k
+    LEFT JOIN a3 ON a2.k=a3.k AND a2.y=a3.y
+    ORDER BY 1,2,3;
+}
+expect {
+    1|10|20
+    2|11|
+    2|15|21
+    3||
+    4||
+    5|11|
+    5|15|21
+}
+
+@setup base_join_data
+test adv-left-using-multi-col {
+    SELECT a1.id,a2.id,k,y
+    FROM a1 LEFT JOIN a2 USING(k,y)
+    ORDER BY a1.id,a2.id;
+}
+expect {
+    1|10|1|10
+    2|15|2|20
+    3|||20
+    4||4|
+    5||2|25
+}
+
+# ============================================================
+# RIGHT joins
+# ============================================================
+
+@setup base_join_data
+test adv-right-anti-join {
+    SELECT a2.id
+    FROM a1 RIGHT JOIN a2 ON a1.k=a2.k
+    WHERE a1.id IS NULL
+    ORDER BY a2.id;
+}
+expect {
+    12
+    13
+    14
+}
+
+@setup base_join_data
+test adv-right-where-right-side-only {
+    SELECT a1.id,a2.id
+    FROM a1 RIGHT JOIN a2 ON a1.k=a2.k
+    WHERE a2.k>=2 OR a2.k IS NULL
+    ORDER BY a1.id,a2.id;
+}
+expect {
+    |12
+    |13
+    |14
+    2|11
+    2|15
+    5|11
+    5|15
+}
+
+@setup base_join_data
+test adv-right-then-inner-chain {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1 RIGHT JOIN a2 ON a1.k=a2.k
+    JOIN a3 ON a2.k=a3.k
+    ORDER BY a1.id,a2.id,a3.id;
+}
+expect {
+    |14|22
+    1|10|20
+    2|11|21
+    2|11|24
+    2|15|21
+    2|15|24
+    5|11|21
+    5|11|24
+    5|15|21
+    5|15|24
+}
+
+@setup base_join_data
+test adv-inner-then-right-chain {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1 JOIN a2 ON a1.y=a2.y
+    RIGHT JOIN a3 ON a2.k=a3.k
+    ORDER BY a1.id,a2.id,a3.id;
+}
+expect {
+    ||22
+    ||23
+    1|10|20
+    2|15|21
+    2|15|24
+    3|15|21
+    3|15|24
+}
+
+@setup base_join_data
+test adv-comma-plus-right-precedence {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1, a2 RIGHT JOIN a3 ON a2.k=a3.k
+    WHERE a1.k=2
+    ORDER BY a1.id,a2.id,a3.id;
+}
+expect {
+    2|10|20
+    2|11|21
+    2|11|24
+    2|14|22
+    2|15|21
+    2|15|24
+    5|10|20
+    5|11|21
+    5|11|24
+    5|14|22
+    5|15|21
+    5|15|24
+}
+
+# ============================================================
+# FULL OUTER joins
+# ============================================================
+
+@setup base_join_data
+test adv-full-basic {
+    SELECT a1.id,a2.id
+    FROM a1 FULL OUTER JOIN a2 ON a1.k=a2.k
+    ORDER BY coalesce(a1.id,0),coalesce(a2.id,0);
+}
+expect {
+    |12
+    |13
+    |14
+    1|10
+    2|11
+    2|15
+    3|
+    4|
+    5|11
+    5|15
+}
+
+@setup base_join_data
+test adv-full-where-unmatched-only {
+    SELECT a1.id,a2.id
+    FROM a1 FULL OUTER JOIN a2 ON a1.k=a2.k
+    WHERE a1.id IS NULL OR a2.id IS NULL
+    ORDER BY coalesce(a1.id,0),coalesce(a2.id,0);
+}
+expect {
+    |12
+    |13
+    |14
+    3|
+    4|
+}
+
+@setup base_join_data
+test adv-full-composite-equality {
+    SELECT a1.id,a2.id
+    FROM a1 FULL OUTER JOIN a2 ON a1.k=a2.k AND a1.y=a2.y
+    ORDER BY coalesce(a1.id,0),coalesce(a2.id,0);
+}
+expect {
+    |11
+    |12
+    |13
+    |14
+    1|10
+    2|15
+    3|
+    4|
+    5|
+}
+
+@setup base_join_data
+test adv-full-aggregate {
+    SELECT count(*),count(a1.id),count(a2.id),sum(coalesce(a1.y,0)+coalesce(a2.y,0))
+    FROM a1 FULL OUTER JOIN a2 ON a1.k=a2.k;
+}
+expect {
+    10|7|8|458
+}
+
+@setup base_join_data
+test adv-inner-then-full {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1 JOIN a2 ON a1.k=a2.k
+    FULL OUTER JOIN a3 ON a2.k=a3.k
+    ORDER BY coalesce(a1.id,0),coalesce(a2.id,0),coalesce(a3.id,0);
+}
+expect {
+    ||22
+    ||23
+    1|10|20
+    2|11|21
+    2|11|24
+    2|15|21
+    2|15|24
+    5|11|21
+    5|11|24
+    5|15|21
+    5|15|24
+}
+
+@setup base_join_data
+test adv-full-then-left {
+    SELECT a1.id,a2.id,a3.id
+    FROM a1 FULL OUTER JOIN a2 ON a1.k=a2.k
+    LEFT JOIN a3 ON coalesce(a1.k,a2.k)=a3.k
+    ORDER BY coalesce(a1.id,0),coalesce(a2.id,0),coalesce(a3.id,0);
+}
+expect {
+    |12|
+    |13|
+    |14|22
+    1|10|20
+    2|11|21
+    2|11|24
+    2|15|21
+    2|15|24
+    3||
+    4||
+    5|11|21
+    5|11|24
+    5|15|21
+    5|15|24
+}
+
+# ============================================================
+# NATURAL / USING combinations
+# ============================================================
+
+@setup natural_join_data
+test adv-natural-inner {
+    SELECT a,b,c,d
+    FROM n1 NATURAL JOIN n2
+    ORDER BY a;
+}
+expect {
+    1|10|x|p
+}
+
+@setup natural_join_data
+test adv-natural-left {
+    SELECT a,b,c,d
+    FROM n1 NATURAL LEFT JOIN n2
+    ORDER BY a;
+}
+expect {
+    1|10|x|p
+    2|20|y|
+    3||z|
+    4|40|w|
+}
+
+@setup natural_join_data
+test adv-using-three-way {
+    SELECT n1.a,n2.a,n3.a,n1.b,n2.b,n3.b
+    FROM n1 JOIN n2 USING(a) JOIN n3 USING(a)
+    ORDER BY n1.a;
+}
+expect {
+    1|1|1|10|10|10
+    2|2|2|20|99|20
+}
+
+@setup natural_join_data
+test adv-left-using-two-columns {
+    SELECT n1.a,n1.b,n2.d
+    FROM n1 LEFT JOIN n2 USING(a,b)
+    ORDER BY n1.a;
+}
+expect {
+    1|10|p
+    2|20|
+    3||
+    4|40|
+}
+
+# ============================================================
+# Expected error paths (intentional limitations)
+# ============================================================
+
+@skip-if sqlite "supported in sqlite"
+test adv-right-using-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    SELECT * FROM t1 RIGHT JOIN t2 USING(a);
+}
+expect error {
+    RIGHT JOIN with USING is not yet supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-natural-right-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    SELECT * FROM t1 NATURAL RIGHT JOIN t2;
+}
+expect error {
+    RIGHT JOIN with NATURAL is not yet supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-right-subquery-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    SELECT * FROM t1 RIGHT JOIN (SELECT * FROM t2) s ON t1.a=s.a;
+}
+expect error {
+    RIGHT JOIN with a subquery on the right side is not yet supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-left-then-right-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    CREATE TABLE t3(a INT);
+    SELECT * FROM t1 LEFT JOIN t2 ON t1.a=t2.a RIGHT JOIN t3 ON t2.a=t3.a;
+}
+expect error {
+    RIGHT JOIN following a LEFT or FULL OUTER JOIN is not yet supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-full-non-equi-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a > t2.a;
+}
+expect error {
+    FULL OUTER JOIN requires an equality condition in the ON clause
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-full-chaining-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    CREATE TABLE t3(a INT);
+    SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a=t2.a FULL OUTER JOIN t3 ON t2.a=t3.a;
+}
+expect error {
+    FULL OUTER JOIN chaining is not yet supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-cross-join-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    SELECT * FROM t1 CROSS JOIN t2;
+}
+expect error {
+    CROSS JOIN is not supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test adv-parenthesized-from-errors {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(a INT);
+    CREATE TABLE t3(a INT);
+    SELECT * FROM (t1 RIGHT JOIN t2 ON t1.a=t2.a) LEFT JOIN t3 ON t2.a=t3.a;
+}
+expect error {
+    Parenthesized FROM clause subqueries are not supported
+}
