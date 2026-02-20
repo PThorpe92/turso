@@ -1707,6 +1707,14 @@ fn parse_join(
     if natural && constraint.is_some() {
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
     }
+    if right_outer {
+        if natural {
+            crate::bail_parse_error!("RIGHT JOIN with NATURAL is not yet supported");
+        }
+        if matches!(constraint, Some(ast::JoinConstraint::Using(_))) {
+            crate::bail_parse_error!("RIGHT JOIN with USING is not yet supported");
+        }
+    }
 
     // this is called once for each join, so we only need to check the rightmost table
     // against all previous tables for duplicates
