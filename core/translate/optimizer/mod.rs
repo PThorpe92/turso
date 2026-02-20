@@ -13,7 +13,7 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            ColumnUsedMask, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            ColumnUsedMask, EphemeralRowidMode, HashJoinOp, HashJoinType, IndexMethodQuery,
             NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
             SeekKeyComponent,
         },
@@ -1809,6 +1809,12 @@ fn optimize_table_access(
             break;
         }
         if !has_prior_constraints {
+            // FULL OUTER may still require materialization even without prior
+            // constraints (e.g. a Cartesian-prefix build). Disabling it here
+            // can duplicate unmatched probe rows across outer loop iterations.
+            if hash_join_op.join_type == HashJoinType::FullOuter {
+                continue;
+            }
             hash_join_op.materialize_build_input = false;
         }
     }

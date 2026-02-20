@@ -555,23 +555,29 @@ pub fn join_lhs_and_rhs<'a>(
                         materialize_build_input,
                         use_bloom_filter,
                         join_keys,
+                        join_type,
                         ..
                     } = &mut hash_join_method.params
                     {
+                        let full_outer_requires_prefix_materialization = *join_type
+                            == HashJoinType::FullOuter
+                            && prior_mask.tables_iter().any(|idx| idx != build_table_idx);
                         let needs_materialization = build_has_uncovered_prior_constraints(
                             lhs_constraints,
                             join_keys,
                             &prior_mask,
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
-                            || !build_table_is_last;
+                            || !build_table_is_last
+                            || full_outer_requires_prefix_materialization;
                         let estimated_filtered_rows = (*build_base_rows)
                             * build_self_selectivity
                             * prior_constraint_selectivity;
 
                         // Hard cap: avoid materializing huge lists when materialization is required.
                         let materialization_too_large = needs_materialization
-                            && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
+                            && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS
+                            && *join_type != HashJoinType::FullOuter;
                         let can_materialize =
                             build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
                         let selectivity_threshold = if probe_multiplier > 1.0 {
