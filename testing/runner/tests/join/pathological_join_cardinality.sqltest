@@ -1,0 +1,357 @@
+@database :memory:
+
+# Pathological join-cardinality stress tests:
+# heavy duplicates, NULL-heavy keys, and mixed join chains.
+
+setup pathological_base_data {
+    CREATE TABLE p1(id INT, k1 INT, k2 INT, v TEXT);
+    CREATE TABLE p2(id INT, k1 INT, k2 INT, v TEXT);
+    CREATE TABLE p3(id INT, k1 INT, k2 INT, v TEXT);
+    CREATE TABLE p4(id INT, k1 INT, k2 INT, v TEXT);
+
+    INSERT INTO p1 VALUES
+        (1,1,10,'a'),(2,1,10,'b'),(3,1,NULL,'c'),(4,2,20,'d'),
+        (5,2,20,'e'),(6,3,30,'f'),(7,NULL,30,'g'),(8,4,NULL,'h'),
+        (9,5,50,'i'),(10,5,50,'j'),(11,6,60,'k'),(12,NULL,NULL,'l');
+
+    INSERT INTO p2 VALUES
+        (101,1,10,'A'),(102,1,10,'B'),(103,2,20,'C'),(104,2,NULL,'D'),
+        (105,3,30,'E'),(106,3,30,'F'),(107,4,40,'G'),(108,NULL,30,'H'),
+        (109,5,50,'I'),(110,7,70,'J'),(111,NULL,NULL,'K'),(112,5,50,'L');
+
+    INSERT INTO p3 VALUES
+        (201,1,10,'u'),(202,2,20,'v'),(203,2,20,'w'),(204,3,NULL,'x'),
+        (205,4,40,'y'),(206,NULL,30,'z'),(207,5,50,'aa'),(208,8,80,'bb'),
+        (209,NULL,NULL,'cc'),(210,5,50,'dd');
+
+    INSERT INTO p4 VALUES
+        (301,1,10,'m'),(302,2,20,'n'),(303,2,20,'o'),(304,3,30,'p'),
+        (305,5,50,'q'),(306,5,NULL,'r'),(307,NULL,30,'s'),(308,9,90,'t'),
+        (309,NULL,NULL,'u');
+}
+
+setup pathological_natural_data {
+    CREATE TABLE n1(a INT, b INT, c TEXT);
+    CREATE TABLE n2(a INT, b INT, d TEXT);
+    CREATE TABLE n3(a INT, b INT, e TEXT);
+    INSERT INTO n1 VALUES (1,10,'x'),(2,20,'y'),(3,NULL,'z'),(4,40,'w');
+    INSERT INTO n2 VALUES (1,10,'p'),(2,99,'q'),(3,NULL,'r'),(5,50,'s');
+    INSERT INTO n3 VALUES (1,10,'m'),(2,20,'n'),(5,50,'o');
+}
+
+setup pathological_generated_data {
+    CREATE TABLE g1(id INT, k INT);
+    CREATE TABLE g2(id INT, k INT);
+    CREATE TABLE g3(id INT, k INT);
+
+    INSERT INTO g1
+    SELECT value, CASE WHEN value % 10 = 0 THEN NULL ELSE value % 7 END
+    FROM generate_series(1,210);
+
+    INSERT INTO g2
+    SELECT value, CASE WHEN value % 9 = 0 THEN NULL ELSE value % 7 END
+    FROM generate_series(1,189);
+
+    INSERT INTO g3
+    SELECT value, CASE WHEN value % 8 = 0 THEN NULL ELSE value % 7 END
+    FROM generate_series(1,168);
+}
+
+# ============================================================
+# Dense duplicate / NULL-heavy base data
+# ============================================================
+
+@setup pathological_base_data
+test patho-inner-k1-cardinality {
+    SELECT count(*) FROM p1 JOIN p2 ON p1.k1=p2.k1;
+}
+expect {
+    17
+}
+
+@setup pathological_base_data
+test patho-inner-composite-cardinality {
+    SELECT count(*) FROM p1 JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2;
+}
+expect {
+    12
+}
+
+@setup pathological_base_data
+test patho-inner-using-composite-cardinality {
+    SELECT count(*) FROM p1 JOIN p2 USING(k1,k2);
+}
+expect {
+    12
+}
+
+@setup pathological_base_data
+test patho-left-composite-counts {
+    SELECT count(*),count(p2.id),sum(p2.id IS NULL)
+    FROM p1 LEFT JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2;
+}
+expect {
+    17|12|5
+}
+
+@setup pathological_base_data
+test patho-left-on-filter-counts {
+    SELECT count(*),count(p2.id)
+    FROM p1 LEFT JOIN p2
+    ON p1.k1=p2.k1 AND p1.k2=p2.k2 AND p2.v IN ('C','I','L');
+}
+expect {
+    14|6
+}
+
+@setup pathological_base_data
+test patho-left-chain-counts {
+    SELECT count(*),count(p2.id),count(p3.id)
+    FROM p1
+    LEFT JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    LEFT JOIN p3 ON p2.k1=p3.k1 AND p2.k2=p3.k2;
+}
+expect {
+    23|18|16
+}
+
+@setup pathological_base_data
+test patho-left-chain-row-shape {
+    SELECT p1.id,p2.id,p3.id
+    FROM p1
+    LEFT JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    LEFT JOIN p3 ON p2.k1=p3.k1 AND p2.k2=p3.k2
+    WHERE p1.k1 IN (1,2)
+    ORDER BY p1.id,p2.id,p3.id;
+}
+expect {
+    1|101|201
+    1|102|201
+    2|101|201
+    2|102|201
+    3||
+    4|103|202
+    4|103|203
+    5|103|202
+    5|103|203
+}
+
+@setup pathological_base_data
+test patho-right-anti-count {
+    SELECT count(*)
+    FROM p1 RIGHT JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    WHERE p1.id IS NULL;
+}
+expect {
+    5
+}
+
+@setup pathological_base_data
+test patho-right-then-inner-counts {
+    SELECT count(*),count(p1.id),count(p2.id),count(p3.id)
+    FROM p1
+    RIGHT JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    JOIN p3 ON p2.k1=p3.k1;
+}
+expect {
+    21|18|21|21
+}
+
+@setup pathological_base_data
+test patho-full-composite-counts {
+    SELECT count(*),count(p1.id),count(p2.id)
+    FROM p1 FULL OUTER JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2;
+}
+expect {
+    22|17|17
+}
+
+@setup pathological_base_data
+test patho-full-unmatched-split {
+    SELECT sum(p1.id IS NULL),sum(p2.id IS NULL)
+    FROM p1 FULL OUTER JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2;
+}
+expect {
+    5|5
+}
+
+@setup pathological_base_data
+test patho-full-filtered-key-domain {
+    SELECT count(*)
+    FROM p1 FULL OUTER JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    WHERE coalesce(p1.k1,p2.k1) IN (1,2,5);
+}
+expect {
+    12
+}
+
+@setup pathological_base_data
+test patho-full-ordered-row-shape {
+    SELECT p1.id,p2.id
+    FROM p1 FULL OUTER JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    ORDER BY coalesce(p1.id,0),coalesce(p2.id,0);
+}
+expect {
+    |104
+    |107
+    |108
+    |110
+    |111
+    1|101
+    1|102
+    2|101
+    2|102
+    3|
+    4|103
+    5|103
+    6|105
+    6|106
+    7|
+    8|
+    9|109
+    9|112
+    10|109
+    10|112
+    11|
+    12|
+}
+
+@setup pathological_base_data
+test patho-inner-then-full-counts {
+    SELECT count(*),count(p1.id),count(p2.id),count(p3.id)
+    FROM p1 JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    FULL OUTER JOIN p3 ON p2.k1=p3.k1 AND p2.k2=p3.k2;
+}
+expect {
+    23|18|18|21
+}
+
+@setup pathological_base_data
+test patho-full-then-left-chain-counts {
+    SELECT count(*),count(p1.id),count(p2.id),count(p3.id),count(p4.id)
+    FROM p1 FULL OUTER JOIN p2 ON p1.k1=p2.k1 AND p1.k2=p2.k2
+    LEFT JOIN p3 ON coalesce(p1.k1,p2.k1)=p3.k1
+    LEFT JOIN p4 ON coalesce(p1.k1,p2.k1)=p4.k1;
+}
+expect {
+    43|35|38|37|35
+}
+
+@setup pathological_base_data
+test patho-comma-left-precedence-cardinality {
+    SELECT count(*)
+    FROM p1, p2 LEFT JOIN p3 ON p2.k1=p3.k1
+    WHERE p1.k1=1;
+}
+expect {
+    48
+}
+
+# ============================================================
+# NATURAL / USING with NULL-heavy keys
+# ============================================================
+
+@setup pathological_natural_data
+test patho-natural-left-rowcount {
+    SELECT count(*) FROM n1 NATURAL LEFT JOIN n2;
+}
+expect {
+    4
+}
+
+@setup pathological_natural_data
+test patho-using-three-way-rowcount {
+    SELECT count(*) FROM n1 JOIN n2 USING(a) JOIN n3 USING(a);
+}
+expect {
+    2
+}
+
+# ============================================================
+# Larger generated cardinality stress
+# ============================================================
+
+@setup pathological_generated_data
+test patho-generated-inner-cardinality {
+    SELECT count(*) FROM g1 JOIN g2 ON g1.k=g2.k;
+}
+expect {
+    4536
+}
+
+@setup pathological_generated_data
+test patho-generated-left-cardinality {
+    SELECT count(*),count(g2.id),sum(g2.id IS NULL)
+    FROM g1 LEFT JOIN g2 ON g1.k=g2.k;
+}
+expect {
+    4557|4536|21
+}
+
+@setup pathological_generated_data
+test patho-generated-right-anti-cardinality {
+    SELECT count(*)
+    FROM g1 RIGHT JOIN g2 ON g1.k=g2.k
+    WHERE g1.id IS NULL;
+}
+expect {
+    21
+}
+
+@setup pathological_generated_data
+test patho-generated-right-anti-row-shape {
+    SELECT g1.id,g2.id
+    FROM g1 RIGHT JOIN g2 ON g1.k=g2.k
+    WHERE g1.id IS NULL
+    ORDER BY g2.id
+    LIMIT 10;
+}
+expect {
+    |9
+    |18
+    |27
+    |36
+    |45
+    |54
+    |63
+    |72
+    |81
+    |90
+}
+
+@setup pathological_generated_data
+test patho-generated-full-cardinality {
+    SELECT count(*),count(g1.id),count(g2.id)
+    FROM g1 FULL OUTER JOIN g2 ON g1.k=g2.k;
+}
+expect {
+    4578|4557|4557
+}
+
+@setup pathological_generated_data
+test patho-generated-full-key-distribution {
+    SELECT coalesce(g1.k,g2.k) AS kk,count(*),count(g1.id),count(g2.id)
+    FROM g1 FULL OUTER JOIN g2 ON g1.k=g2.k
+    GROUP BY coalesce(g1.k,g2.k)
+    ORDER BY coalesce(g1.k,g2.k);
+}
+expect {
+    |42|21|21
+    0|648|648|648
+    1|648|648|648
+    2|648|648|648
+    3|648|648|648
+    4|648|648|648
+    5|648|648|648
+    6|648|648|648
+}
+
+@setup pathological_generated_data
+test patho-generated-inner-left-chain-cardinality {
+    SELECT count(*),count(g1.id),count(g2.id),count(g3.id)
+    FROM g1 JOIN g2 ON g1.k=g2.k
+    LEFT JOIN g3 ON g2.k=g3.k;
+}
+expect {
+    95256|95256|95256|95256
+}

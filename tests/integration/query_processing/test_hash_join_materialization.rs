@@ -283,3 +283,91 @@ ORDER BY t1.id, t2.id, t3.id, sub_t4.a LIMIT 50";
         "Mismatch after outer join conversion with hash join materialization"
     );
 }
+
+#[test]
+/// Regression: WHERE predicates on tables left of a RIGHT JOIN must be
+/// evaluated after RowSetAdd tracking, even when those tables are represented
+/// via hash-join payload registers.
+fn right_join_defers_left_where_for_hash_payload_tables() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = tmp_db.connect_limbo();
+
+    let schema = [
+        "CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT)",
+        "CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT)",
+        "CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT)",
+        "CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT)",
+    ];
+    for stmt in &schema {
+        limbo_exec_rows(&conn, stmt);
+        sqlite_conn.execute(stmt, []).unwrap();
+    }
+
+    sqlite_conn.execute("BEGIN", []).unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=150_i64 {
+        let t1 = format!(
+            "INSERT INTO t1(id,a,b,c,d) VALUES ({id}, {}, {}, {}, {})",
+            id % 17,
+            id % 5,
+            id % 13,
+            id % 7
+        );
+        let t2 = format!(
+            "INSERT INTO t2(id,a,b,c,d) VALUES ({id}, {}, {}, {}, {})",
+            id % 11,
+            id % 5,
+            id % 3,
+            id % 7
+        );
+        let t3 = format!(
+            "INSERT INTO t3(id,a,b,c,d) VALUES ({id}, {}, {}, {}, {})",
+            id % 11,
+            id % 6,
+            id % 3,
+            id % 9
+        );
+        let t4 = format!(
+            "INSERT INTO t4(id,a,b,c,d) VALUES ({id}, {}, {}, {}, {})",
+            id % 19,
+            id % 8,
+            id % 10,
+            id % 4
+        );
+        conn.execute(&t1).unwrap();
+        conn.execute(&t2).unwrap();
+        conn.execute(&t3).unwrap();
+        conn.execute(&t4).unwrap();
+        sqlite_conn.execute(&t1, []).unwrap();
+        sqlite_conn.execute(&t2, []).unwrap();
+        sqlite_conn.execute(&t3, []).unwrap();
+        sqlite_conn.execute(&t4, []).unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    sqlite_conn.execute("COMMIT", []).unwrap();
+
+    let query = "SELECT sub_t1.a, t2.id, t3.id, t4.id \
+FROM (SELECT * FROM t1 WHERE a IS NOT NULL) AS sub_t1 \
+JOIN t2 ON sub_t1.b = t2.b AND sub_t1.d = t2.d \
+JOIN t3 ON t2.a = t3.a AND t2.c = t3.c \
+RIGHT JOIN t4 ON t3.b = t4.b \
+WHERE t3.b IS NULL AND t4.b <> 19 \
+ORDER BY sub_t1.a, t2.id, t3.id, t4.id LIMIT 50";
+
+    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
+    let has_hash = explain_rows.iter().any(|row| {
+        row.get(1)
+            .and_then(value_as_text)
+            .is_some_and(|op| op == "HashBuild" || op == "HashProbe")
+    });
+    assert!(has_hash, "expected hash join in EXPLAIN output");
+
+    let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
+    let limbo_rows = limbo_exec_rows(&conn, query);
+    assert_eq!(
+        sqlite_rows, limbo_rows,
+        "Mismatch in RIGHT JOIN unmatched-row handling with hash payload tables"
+    );
+}
