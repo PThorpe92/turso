@@ -1835,6 +1835,39 @@ pub fn open_loop(
             SubqueryRefFilter::WithoutSubqueryRefs,
         )?;
 
+        // RIGHT JOIN can defer left-side WHERE terms past the join table to
+        // preserve RowSetAdd semantics. If such a term was also consumed by an
+        // access path, it still must be evaluated for matched rows here.
+        if table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.right_outer && !ji.full_outer)
+        {
+            for cond in predicates
+                .iter()
+                .filter(|c| c.consumed)
+                .filter(|c| c.from_outer_join.is_none())
+                .filter(|c| !c.from_inner_join_on)
+                .filter(|c| c.deferred_past_right_join == Some(table.internal_id))
+            {
+                let jump_target_when_true = program.allocate_label();
+                let condition_metadata = ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true,
+                    jump_target_when_false: condition_fail_target,
+                    jump_target_when_null: condition_fail_target,
+                };
+                translate_condition_expr(
+                    program,
+                    table_references,
+                    &cond.expr,
+                    condition_metadata,
+                    &t_ctx.resolver,
+                )?;
+                program.preassign_label_to_next_insn(jump_target_when_true);
+            }
+        }
+
         // FULL OUTER hash joins may consume build/probe WHERE terms while selecting
         // access paths. Those terms still need post-join evaluation for each
         // matched pair (and each hash-next candidate), otherwise they are dropped.

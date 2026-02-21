@@ -584,8 +584,7 @@ fn defer_where_conditions_past_right_join_builds(plan: &mut SelectPlan) -> Resul
     }
 
     for term in plan.where_clause.iter_mut() {
-        if term.consumed
-            || term.from_outer_join.is_some()
+        if term.from_outer_join.is_some()
             || term.from_inner_join_on
             || term.deferred_past_right_join.is_some()
         {
@@ -966,9 +965,6 @@ fn prune_join_order_for_materialized_inputs(
         TableMask::new()
     };
     for term in plan.where_clause.iter_mut() {
-        if term.consumed {
-            continue;
-        }
         let mask = table_mask_from_expr(
             &term.expr,
             &plan.table_references,
@@ -995,6 +991,9 @@ fn prune_join_order_for_materialized_inputs(
                     term.deferred_past_right_join = Some(probe_id);
                     continue;
                 }
+            }
+            if term.consumed {
+                continue;
             }
             term.consumed = true;
         }
