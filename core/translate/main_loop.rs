@@ -761,6 +761,18 @@ fn emit_hash_build_phase(
             if cond.consumed || cond.deferred_past_right_join.is_some() {
                 continue;
             }
+            // ON terms from outer joins must be evaluated in the probe loop.
+            // Filtering build rows with these terms can drop rows that should
+            // be emitted as unmatched.
+            if cond.from_outer_join.is_some() {
+                continue;
+            }
+            // FULL OUTER JOIN must build from the full build side. Applying
+            // build-only WHERE predicates here can turn matched probe rows
+            // into false "unmatched" emissions.
+            if hash_join_op.join_type == HashJoinType::FullOuter {
+                continue;
+            }
             let mask =
                 table_mask_from_expr(&cond.expr, table_references, non_from_clause_subqueries)?;
             if !mask.contains_table(hash_join_op.build_table_idx)
@@ -1823,6 +1835,53 @@ pub fn open_loop(
             SubqueryRefFilter::WithoutSubqueryRefs,
         )?;
 
+        // FULL OUTER hash joins may consume build/probe WHERE terms while selecting
+        // access paths. Those terms still need post-join evaluation for each
+        // matched pair (and each hash-next candidate), otherwise they are dropped.
+        if let Operation::HashJoin(ref hj) = table.op {
+            if matches!(hj.join_type, HashJoinType::FullOuter) {
+                let hash_ctx = t_ctx
+                    .hash_table_contexts
+                    .get(&hj.build_table_idx)
+                    .expect("should have hash context for build table");
+                let has_gosub = hash_ctx.inner_loop_gosub_reg.is_some()
+                    && hash_ctx.inner_loop_gosub_label.is_some();
+                let allowed_tables = {
+                    let mut m = TableMask::new();
+                    m.add_table(hj.build_table_idx);
+                    m.add_table(joined_table_index);
+                    m
+                };
+                for cond in predicates
+                    .iter()
+                    .filter(|c| c.consumed)
+                    .filter(|c| c.from_outer_join.is_none())
+                    .filter(|c| !c.from_inner_join_on)
+                    .filter(|c| c.deferred_past_right_join.is_none())
+                    .filter(|c| {
+                        !has_gosub
+                            || expr_tables_subset_of(&c.expr, table_references, &allowed_tables)
+                    })
+                {
+                    let jump_target_when_true = program.allocate_label();
+                    let condition_metadata = ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_true,
+                        jump_target_when_false: condition_fail_target,
+                        jump_target_when_null: condition_fail_target,
+                    };
+                    translate_condition_expr(
+                        program,
+                        table_references,
+                        &cond.expr,
+                        condition_metadata,
+                        &t_ctx.resolver,
+                    )?;
+                    program.preassign_label_to_next_insn(jump_target_when_true);
+                }
+            }
+        }
+
         for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
             turso_assert!(subquery.correlated, "subquery must be correlated");
             let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
@@ -2580,7 +2639,10 @@ pub fn close_loop<'a>(
                             for cond in plan
                                 .where_clause
                                 .iter()
-                                .filter(|c| !c.consumed && c.from_outer_join.is_none())
+                                // FULL OUTER unmatched-probe emission is outside the
+                                // access method path, so consumed WHERE terms must
+                                // still be applied here.
+                                .filter(|c| c.from_outer_join.is_none() && !c.from_inner_join_on)
                                 .filter(|c| {
                                     !has_gosub
                                         || expr_tables_subset_of(
@@ -2685,10 +2747,16 @@ pub fn close_loop<'a>(
                             m.add_table(table_index);
                             m
                         };
+                        let reevaluate_consumed =
+                            matches!(hash_join_op.join_type, HashJoinType::FullOuter);
                         for cond in plan
                             .where_clause
                             .iter()
-                            .filter(|c| !c.consumed && c.from_outer_join.is_none())
+                            .filter(|c| {
+                                (reevaluate_consumed || !c.consumed)
+                                    && c.from_outer_join.is_none()
+                                    && !c.from_inner_join_on
+                            })
                             .filter(|c| {
                                 !has_gosub
                                     || expr_tables_subset_of(
@@ -3056,12 +3124,21 @@ pub fn close_loop<'a>(
             // already used during the main loop's join logic and must not be
             // re-evaluated here where both sides are NullRow'd (NULL = NULL → NULL
             // would incorrectly filter out unmatched rows).
+            //
+            // And if a condition was deferred past a RIGHT JOIN, only evaluate it
+            // in the unmatched scan of that same RIGHT JOIN table. In chained
+            // RIGHT JOINs this prevents an earlier unmatched scan from applying a
+            // predicate that belongs to a later RIGHT JOIN level.
             // Analogous to SQLite's EP_InnerON handling.
             for cond in plan
                 .where_clause
                 .iter()
                 .filter(|c| c.from_outer_join.is_none())
                 .filter(|c| !c.from_inner_join_on)
+                .filter(|c| {
+                    c.deferred_past_right_join
+                        .is_none_or(|table_id| table_id == table.internal_id)
+                })
                 .filter(|c| {
                     !has_gosub
                         || expr_tables_subset_of(&c.expr, &plan.table_references, &allowed_tables)

@@ -509,10 +509,17 @@ pub fn join_lhs_and_rhs<'a>(
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
 
+            let is_full_outer_join = rhs_table_reference
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.full_outer);
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
             // build input is materialized from the join prefix.
-            let allow_hash_join = !rhs_has_selective_seek
+            //
+            // FULL OUTER always requires hash join for unmatched-row emission, so
+            // we cannot reject hash just because the probe has a selective seek.
+            let allow_hash_join = (!rhs_has_selective_seek || is_full_outer_join)
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
                 && !chaining_across_outer;
@@ -604,6 +611,11 @@ pub fn join_lhs_and_rhs<'a>(
                         hash_join_allowed = build_is_eligible
                             && (!needs_materialization || build_has_rowid)
                             && !materialization_too_large;
+                        if *join_type == HashJoinType::FullOuter {
+                            // FULL OUTER requires hash join; don't let NLJ-oriented
+                            // eligibility heuristics reject a valid FULL OUTER plan.
+                            hash_join_allowed = true;
+                        }
 
                         if hash_join_allowed {
                             let should_materialize = if needs_materialization {

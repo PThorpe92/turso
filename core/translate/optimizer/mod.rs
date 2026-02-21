@@ -1195,9 +1195,12 @@ fn optimize_table_access(
             .iter_mut()
             .enumerate()
             .filter(|(_, t)| {
-                t.join_info
-                    .as_ref()
-                    .is_some_and(|join_info| join_info.outer)
+                t.join_info.as_ref().is_some_and(|join_info| {
+                    // This null-rejecting rewrite is only valid for LEFT OUTER joins.
+                    // FULL OUTER requires side-aware reduction (to LEFT/RIGHT/INNER),
+                    // which is handled separately.
+                    join_info.outer && !join_info.full_outer
+                })
             })
         {
             // Check if there's a constraint that would filter out NULL rows,

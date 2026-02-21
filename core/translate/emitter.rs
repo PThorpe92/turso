@@ -557,7 +557,10 @@ fn defer_where_conditions_past_right_join_builds(plan: &mut SelectPlan) -> Resul
     let mut right_join_build_masks: Vec<(TableMask, TableInternalId)> = Vec::new();
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
-        let is_right_join = table.join_info.as_ref().is_some_and(|ji| ji.right_outer);
+        let is_right_join = table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.right_outer && !ji.full_outer);
         if is_right_join {
             // Build mask of all tables left of the RIGHT JOIN table.
             let mut left_mask = TableMask::new();
@@ -593,12 +596,18 @@ fn defer_where_conditions_past_right_join_builds(plan: &mut SelectPlan) -> Resul
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        // Check if this condition references only build-side tables of a RIGHT JOIN.
+        // Defer past the RIGHT-most join that this build-side condition depends on.
+        // In chains like `t1 RIGHT JOIN t2 ... RIGHT JOIN t3 ...`, a condition on
+        // `t1` must not be applied after the first RIGHT JOIN (t2), or rows needed
+        // to match t3 can be filtered too early.
+        let mut defer_to_probe = None;
         for &(ref build_mask, probe_id) in &right_join_build_masks {
             if build_mask.contains_all(&mask) && !mask.is_empty() {
-                term.deferred_past_right_join = Some(probe_id);
-                break;
+                defer_to_probe = Some(probe_id);
             }
+        }
+        if let Some(probe_id) = defer_to_probe {
+            term.deferred_past_right_join = Some(probe_id);
         }
     }
     Ok(())
