@@ -237,6 +237,59 @@ expect {
     3|
 }
 
+test full-outer-join-where-rhs-only {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (3);
+    INSERT INTO t2 VALUES (1), (2);
+    SELECT t1.a, t2.b
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+    WHERE t2.b > 0
+    ORDER BY coalesce(t1.a, t2.b);
+}
+expect {
+    1|1
+    |2
+}
+
+test full-outer-join-where-lhs-is-null {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (NULL, 30), (4, NULL), (5, 50);
+    INSERT INTO t2 VALUES (1, 100), (3, 300), (NULL, 400), (5, NULL), (6, 600);
+    SELECT t1.a, t2.c
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c
+    WHERE t1.a IS NULL
+    ORDER BY t1.b, t2.d;
+}
+expect {
+    |3
+    |
+    |6
+    |
+}
+
+test full-outer-join-on-lhs-only-predicate {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (NULL, 30), (4, NULL), (5, 50);
+    INSERT INTO t2 VALUES (1, 100), (3, 300), (NULL, 400), (5, NULL), (6, 600);
+    SELECT t1.a, t2.c
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c AND t1.b > 20
+    ORDER BY coalesce(t1.a, t2.c), t1.b, t2.d;
+}
+expect {
+    |
+    |
+    |1
+    1|
+    2|
+    |3
+    4|
+    5|5
+    |6
+}
+
 test full-outer-join-coalesce {
     CREATE TABLE t1(a, b);
     CREATE TABLE t2(c, d);
@@ -1175,6 +1228,65 @@ test right-then-right-join-chain {
 expect {
     |3|3
     ||4
+}
+
+test right-then-right-join-chain-where-middle-null {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    INSERT INTO t3 VALUES (3), (4);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    RIGHT JOIN t2 ON t1.a = t2.b
+    RIGHT JOIN t3 ON t2.b = t3.c
+    WHERE t2.b IS NULL
+    ORDER BY t3.c;
+}
+expect {
+    ||4
+}
+
+test right-then-right-join-chain-where-left-null {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (NULL, 30), (4, NULL), (5, 50);
+    INSERT INTO t2 VALUES (1, 100), (3, 300), (NULL, 400), (5, NULL), (6, 600);
+    INSERT INTO t3 VALUES (3, 900), (5, 901), (6, 902), (NULL, 903);
+    SELECT t1.a, t2.c, t3.e
+    FROM t1
+    RIGHT JOIN t2 ON t1.a = t2.c
+    RIGHT JOIN t3 ON t2.c = t3.e
+    WHERE t1.a IS NULL
+    ORDER BY t3.e, t2.d, t1.b;
+}
+expect {
+    ||
+    |3|3
+    |6|6
+}
+
+test full-outer-join-left-chain-where-lhs-null {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (NULL, 30), (4, NULL), (5, 50);
+    INSERT INTO t2 VALUES (1, 100), (3, 300), (NULL, 400), (5, NULL), (6, 600);
+    INSERT INTO t3 VALUES (3, 900), (5, 901), (6, 902), (NULL, 903);
+    SELECT t1.a, t2.c, t3.e
+    FROM t1
+    FULL OUTER JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t2.c = t3.e
+    WHERE t1.a IS NULL
+    ORDER BY coalesce(t1.a, t2.c), t1.b, t2.d;
+}
+expect {
+    ||
+    ||
+    |3|3
+    |6|6
 }
 
 # FULL OUTER then RIGHT JOIN should error — the unmatched row emission
