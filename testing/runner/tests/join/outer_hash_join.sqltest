@@ -133,6 +133,19 @@ expect {
     2|y|2|b
 }
 
+test right-join-where-left-rowid-filter {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a, b, c, d);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a, b, c, d);
+    INSERT INTO t1 VALUES (1, 10, 0, 5, NULL), (8, 20, 0, 9, NULL);
+    INSERT INTO t2 VALUES (100, 1, 0, 5, NULL), (101, 2, 0, 6, NULL);
+    SELECT t1.id, t1.a, t2.id, t2.a
+    FROM t1 RIGHT JOIN t2 ON t1.c = t2.c
+    WHERE t1.id <> -7 AND t1.id = 8 AND t1.d IS NULL
+    ORDER BY t1.id, t1.a, t2.id, t2.a;
+}
+expect {
+}
+
 # ============================================================
 # FULL OUTER JOIN
 # ============================================================
