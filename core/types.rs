@@ -2488,9 +2488,9 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
         },
         _ => {
             mark_unlikely();
-            return Err(LimboError::Corrupt(format!(
+            Err(LimboError::Corrupt(format!(
                 "Invalid serial type: {serial}"
-            )));
+            )))
         }
     }
 }
