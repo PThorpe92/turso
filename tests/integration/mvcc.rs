@@ -15,7 +15,7 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
         None,
     )?;
     let conn = db.connect()?;
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
     conn.close()?;
     Ok(())
 }
@@ -27,7 +27,7 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
 #[turso_macros::test]
 fn test_mvcc_create_table_on_attached_db(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -237,7 +237,7 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
 #[turso_macros::test]
 fn test_detach_rollbacks_active_mvcc_tx(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_detach.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -275,7 +275,7 @@ fn test_detach_rollbacks_active_mvcc_tx(tmp_db: TempDatabase) -> anyhow::Result<
 fn test_attach_rejects_incompatible_journal_mode(tmp_db: TempDatabase) -> anyhow::Result<()> {
     // Main DB uses MVCC
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     // Attached DB is created in default WAL mode (no MVCC)
     let aux_path = tmp_db.path.with_extension("aux_wal.db");
@@ -335,7 +335,7 @@ fn test_attach_rejects_mvcc_attached_on_wal_main(tmp_db: TempDatabase) -> anyhow
 #[turso_macros::test]
 fn test_mvcc_rollback_reverts_attached_db(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_rb.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -364,7 +364,7 @@ fn test_mvcc_rollback_reverts_attached_db(tmp_db: TempDatabase) -> anyhow::Resul
 #[turso_macros::test]
 fn test_drop_cleans_up_mvcc_transactions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_drop.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -381,7 +381,7 @@ fn test_drop_cleans_up_mvcc_transactions(tmp_db: TempDatabase) -> anyhow::Result
     // A new connection must be able to use the database normally — the
     // dropped connection's MVCC state should have been cleaned up.
     let conn2 = tmp_db.connect_limbo();
-    conn2.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn2.pragma_update("journal_mode", "'mvcc'")?;
     conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
     conn2.execute("INSERT INTO aux.t VALUES (2)")?;
     conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -398,7 +398,7 @@ fn test_drop_cleans_up_mvcc_transactions(tmp_db: TempDatabase) -> anyhow::Result
 #[turso_macros::test]
 fn test_cross_database_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_cross.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -436,7 +436,7 @@ fn test_cross_database_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
 #[turso_macros::test]
 fn test_attached_mvcc_read_to_write_upgrade(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_upgrade.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -468,7 +468,7 @@ fn test_stmt_rollback_on_attached_mvcc_db(tmp_db: TempDatabase) -> anyhow::Resul
     let _ = env_logger::try_init();
 
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_savepoint.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -513,7 +513,7 @@ fn test_stmt_rollback_on_attached_mvcc_db_with_index(tmp_db: TempDatabase) -> an
     let _ = env_logger::try_init();
 
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_savepoint_idx.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -556,7 +556,7 @@ fn test_deferred_fk_violation_rolls_back_attached_mvcc(tmp_db: TempDatabase) -> 
     let _ = env_logger::try_init();
 
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_deferred_fk.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -603,7 +603,7 @@ fn test_named_savepoint_rollback_reverts_attached_mvcc(tmp_db: TempDatabase) -> 
     let _ = env_logger::try_init();
 
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_named_sp.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
@@ -652,7 +652,7 @@ fn test_named_savepoint_release_commits_attached_mvcc(tmp_db: TempDatabase) -> a
     let _ = env_logger::try_init();
 
     let conn = tmp_db.connect_limbo();
-    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let aux_path = tmp_db.path.with_extension("aux_named_sp_rel.db");
     create_mvcc_db(&tmp_db.io, &aux_path)?;
