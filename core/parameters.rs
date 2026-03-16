@@ -42,9 +42,8 @@ impl Parameters {
     }
 
     pub fn count(&self) -> usize {
-        let mut params = self.list.clone();
-        params.dedup();
-        params.len()
+        // Return the largest parameter index: matching `[sqlite3_bind_parameter_count]` behavior
+        self.list.iter().map(|p| p.index().get()).max().unwrap_or(0)
     }
 
     pub fn name(&self, index: NonZero<usize>) -> Option<String> {
@@ -108,5 +107,54 @@ impl Parameters {
                 index
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_with_repeated_indexed_params() {
+        let mut params = Parameters::new();
+        // Simulates: ?3, ?3, ?1, ?1, ?2, ?1
+        params.push("3");
+        params.push("3");
+        params.push("1");
+        params.push("1");
+        params.push("2");
+        params.push("1");
+        assert_eq!(params.count(), 3);
+    }
+
+    #[test]
+    fn count_with_gaps_in_indices() {
+        let mut params = Parameters::new();
+        // ?1 and ?5: count should be 5 (max index), matching sqlite3_bind_parameter_count
+        params.push("1");
+        params.push("5");
+        assert_eq!(params.count(), 5);
+    }
+
+    #[test]
+    fn count_with_repeated_named_params() {
+        let mut params = Parameters::new();
+        params.push("@page");
+        params.push("@page");
+        params.push("@per_page");
+        assert_eq!(params.count(), 2);
+    }
+
+    #[test]
+    fn count_empty() {
+        let params = Parameters::new();
+        assert_eq!(params.count(), 0);
+    }
+
+    #[test]
+    fn count_single_param() {
+        let mut params = Parameters::new();
+        params.push("1");
+        assert_eq!(params.count(), 1);
     }
 }
