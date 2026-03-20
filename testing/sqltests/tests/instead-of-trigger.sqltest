@@ -1,0 +1,562 @@
+@database :memory:
+@requires-file trigger "trigger tests require trigger support"
+
+# Basic INSTEAD OF INSERT trigger on a view
+@cross-check-integrity
+test instead-of-insert-basic {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE TRIGGER trv INSTEAD OF INSERT ON v BEGIN
+        INSERT INTO t VALUES(NEW.id, NEW.val);
+    END;
+    INSERT INTO v VALUES(1, 'hello');
+    SELECT * FROM t;
+}
+expect {
+    1|hello
+}
+
+# INSTEAD OF INSERT with column specification
+@cross-check-integrity
+test instead-of-insert-columns {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val TEXT, extra TEXT);
+    CREATE VIEW v2 AS SELECT id, val, extra FROM t2;
+    CREATE TRIGGER trv2 INSTEAD OF INSERT ON v2 BEGIN
+        INSERT INTO t2 VALUES(NEW.id, NEW.val, NEW.extra);
+    END;
+    INSERT INTO v2(id, val) VALUES(1, 'hello');
+    SELECT * FROM t2;
+}
+expect {
+    1|hello|
+}
+
+# INSTEAD OF INSERT with WHEN clause
+@cross-check-integrity
+test instead-of-insert-when {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v3 AS SELECT * FROM t3;
+    CREATE TRIGGER trv3 INSTEAD OF INSERT ON v3 WHEN NEW.val IS NOT NULL BEGIN
+        INSERT INTO t3 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT INTO v3 VALUES(1, 'hello');
+    INSERT INTO v3 VALUES(2, NULL);
+    SELECT * FROM t3;
+}
+expect {
+    1|hello
+}
+
+# Multiple INSTEAD OF triggers on same view
+@cross-check-integrity
+test instead-of-insert-multiple-triggers {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t4_log(msg TEXT);
+    CREATE VIEW v4 AS SELECT * FROM t4;
+    CREATE TRIGGER trv4a INSTEAD OF INSERT ON v4 BEGIN
+        INSERT INTO t4 VALUES(NEW.id, NEW.val);
+    END;
+    CREATE TRIGGER trv4b INSTEAD OF INSERT ON v4 BEGIN
+        INSERT INTO t4_log VALUES('inserted ' || NEW.val);
+    END;
+    INSERT INTO v4 VALUES(1, 'hello');
+    SELECT * FROM t4;
+    SELECT * FROM t4_log;
+}
+expect {
+    1|hello
+    inserted hello
+}
+
+# Trigger stored in sqlite_schema
+test instead-of-trigger-schema {
+    CREATE TABLE t5(x);
+    CREATE VIEW v5 AS SELECT * FROM t5;
+    CREATE TRIGGER trv5 INSTEAD OF INSERT ON v5 BEGIN
+        INSERT INTO t5 VALUES(NEW.x);
+    END;
+    SELECT type, name, tbl_name FROM sqlite_schema WHERE type='trigger';
+}
+expect {
+    trigger|trv5|v5
+}
+
+# Error: INSTEAD OF trigger on table
+test instead-of-on-table-error {
+    CREATE TABLE t6(x);
+    CREATE TRIGGER bad INSTEAD OF INSERT ON t6 BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create INSTEAD OF trigger on table
+}
+
+# Error: BEFORE trigger on view
+test before-on-view-error {
+    CREATE TABLE t7(x);
+    CREATE VIEW v7 AS SELECT * FROM t7;
+    CREATE TRIGGER bad BEFORE INSERT ON v7 BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create BEFORE trigger on view
+}
+
+# Error: AFTER trigger on view
+test after-on-view-error {
+    CREATE TABLE t8(x);
+    CREATE VIEW v8 AS SELECT * FROM t8;
+    CREATE TRIGGER bad AFTER INSERT ON v8 BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create AFTER trigger on view
+}
+
+# Error: INSERT into view without INSTEAD OF trigger
+test insert-view-no-trigger-error {
+    CREATE TABLE t9(x);
+    CREATE VIEW v9 AS SELECT * FROM t9;
+    INSERT INTO v9 VALUES(1);
+}
+expect error {
+    cannot modify v9
+}
+
+# INSTEAD OF INSERT with IF NOT EXISTS
+@cross-check-integrity
+test instead-of-if-not-exists {
+    CREATE TABLE t10(x);
+    CREATE VIEW v10 AS SELECT * FROM t10;
+    CREATE TRIGGER trv10 INSTEAD OF INSERT ON v10 BEGIN
+        INSERT INTO t10 VALUES(NEW.x);
+    END;
+    CREATE TRIGGER IF NOT EXISTS trv10 INSTEAD OF INSERT ON v10 BEGIN
+        INSERT INTO t10 VALUES(NEW.x);
+    END;
+    INSERT INTO v10 VALUES(42);
+    SELECT * FROM t10;
+}
+expect {
+    42
+}
+
+# DROP TRIGGER on INSTEAD OF trigger
+@cross-check-integrity
+test instead-of-drop-trigger {
+    CREATE TABLE t11(x);
+    CREATE VIEW v11 AS SELECT * FROM t11;
+    CREATE TRIGGER trv11 INSTEAD OF INSERT ON v11 BEGIN
+        INSERT INTO t11 VALUES(NEW.x);
+    END;
+    INSERT INTO v11 VALUES(1);
+    DROP TRIGGER trv11;
+    SELECT * FROM t11;
+    SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='trv11';
+}
+expect {
+    1
+    0
+}
+
+# Trigger body does UPDATE on underlying table
+@cross-check-integrity
+test instead-of-insert-body-update {
+    CREATE TABLE t12(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t12 VALUES(1, 'old');
+    CREATE VIEW v12 AS SELECT * FROM t12;
+    CREATE TRIGGER trv12 INSTEAD OF INSERT ON v12 BEGIN
+        UPDATE t12 SET val = NEW.val WHERE id = NEW.id;
+    END;
+    INSERT INTO v12 VALUES(1, 'new');
+    SELECT * FROM t12;
+}
+expect {
+    1|new
+}
+
+# Trigger body does DELETE on underlying table
+@cross-check-integrity
+test instead-of-insert-body-delete {
+    CREATE TABLE t13(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t13 VALUES(1, 'hello');
+    INSERT INTO t13 VALUES(2, 'world');
+    CREATE VIEW v13 AS SELECT * FROM t13;
+    CREATE TRIGGER trv13 INSTEAD OF INSERT ON v13 BEGIN
+        DELETE FROM t13 WHERE id = NEW.id;
+    END;
+    INSERT INTO v13 VALUES(1, 'ignored');
+    SELECT * FROM t13;
+}
+expect {
+    2|world
+}
+
+# View over JOIN with INSTEAD OF trigger
+@cross-check-integrity
+test instead-of-insert-join-view {
+    CREATE TABLE j1(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE j2(id INTEGER PRIMARY KEY, j1_id INTEGER, extra TEXT);
+    CREATE VIEW vj AS SELECT j1.id as id, j1.name, j2.extra FROM j1 JOIN j2 ON j1.id = j2.j1_id;
+    CREATE TRIGGER trvj INSTEAD OF INSERT ON vj BEGIN
+        INSERT INTO j1 VALUES(NEW.id, NEW.name);
+        INSERT INTO j2 VALUES(NEW.id + 100, NEW.id, NEW.extra);
+    END;
+    INSERT INTO vj VALUES(1, 'alice', 'bonus');
+    SELECT * FROM j1;
+    SELECT * FROM j2;
+}
+expect {
+    1|alice
+    101|1|bonus
+}
+
+# Expression values (not just literals)
+@cross-check-integrity
+test instead-of-insert-expressions {
+    CREATE TABLE t14(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v14 AS SELECT * FROM t14;
+    CREATE TRIGGER trv14 INSTEAD OF INSERT ON v14 BEGIN
+        INSERT INTO t14 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT INTO v14 VALUES(1 + 1, 'hello' || ' world');
+    SELECT * FROM t14;
+}
+expect {
+    2|hello world
+}
+
+# Case-insensitive view name
+@cross-check-integrity
+test instead-of-insert-case-insensitive {
+    CREATE TABLE t15(x);
+    CREATE VIEW MyView AS SELECT * FROM t15;
+    CREATE TRIGGER trv15 INSTEAD OF INSERT ON myview BEGIN
+        INSERT INTO t15 VALUES(NEW.x);
+    END;
+    INSERT INTO MYVIEW VALUES(42);
+    SELECT * FROM t15;
+}
+expect {
+    42
+}
+
+# Nested INSTEAD OF triggers (trigger body inserts into another view)
+@cross-check-integrity
+test instead-of-insert-nested {
+    CREATE TABLE t16(x);
+    CREATE VIEW v16a AS SELECT * FROM t16;
+    CREATE VIEW v16b AS SELECT * FROM t16;
+    CREATE TRIGGER trv16a INSTEAD OF INSERT ON v16a BEGIN
+        INSERT INTO v16b VALUES(NEW.x);
+    END;
+    CREATE TRIGGER trv16b INSTEAD OF INSERT ON v16b BEGIN
+        INSERT INTO t16 VALUES(NEW.x * 10);
+    END;
+    INSERT INTO v16a VALUES(5);
+    SELECT * FROM t16;
+}
+expect {
+    50
+}
+
+# Recursive trigger is safely skipped (default recursive_triggers=off)
+@cross-check-integrity
+test instead-of-insert-recursive-safe {
+    CREATE TABLE t17(x INTEGER);
+    CREATE VIEW v17 AS SELECT * FROM t17;
+    CREATE TRIGGER trv17 INSTEAD OF INSERT ON v17 BEGIN
+        INSERT INTO v17 VALUES(NEW.x + 1);
+    END;
+    INSERT INTO v17 VALUES(1);
+    SELECT count(*) FROM t17;
+}
+expect {
+    0
+}
+
+# INSTEAD OF INSERT inside explicit transaction with rollback
+@cross-check-integrity
+test instead-of-insert-transaction-rollback {
+    CREATE TABLE t18(x INTEGER);
+    CREATE VIEW v18 AS SELECT * FROM t18;
+    CREATE TRIGGER trv18 INSTEAD OF INSERT ON v18 BEGIN
+        INSERT INTO t18 VALUES(NEW.x);
+    END;
+    BEGIN;
+    INSERT INTO v18 VALUES(1);
+    INSERT INTO v18 VALUES(2);
+    ROLLBACK;
+    SELECT count(*) FROM t18;
+}
+expect {
+    0
+}
+
+# INSTEAD OF INSERT inside explicit transaction with commit
+@cross-check-integrity
+test instead-of-insert-transaction-commit {
+    CREATE TABLE t19(x INTEGER);
+    CREATE VIEW v19 AS SELECT * FROM t19;
+    CREATE TRIGGER trv19 INSTEAD OF INSERT ON v19 BEGIN
+        INSERT INTO t19 VALUES(NEW.x);
+    END;
+    BEGIN;
+    INSERT INTO v19 VALUES(1);
+    INSERT INTO v19 VALUES(2);
+    COMMIT;
+    SELECT * FROM t19 ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+# Trigger body with multiple DML statements
+@cross-check-integrity
+test instead-of-insert-multi-stmt-body {
+    CREATE TABLE t20(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t20_audit(msg TEXT);
+    CREATE VIEW v20 AS SELECT * FROM t20;
+    CREATE TRIGGER trv20 INSTEAD OF INSERT ON v20 BEGIN
+        INSERT INTO t20 VALUES(NEW.id, NEW.val);
+        INSERT INTO t20_audit VALUES('inserted id=' || NEW.id);
+        UPDATE t20 SET val = val || '!' WHERE id = NEW.id;
+    END;
+    INSERT INTO v20 VALUES(1, 'hello');
+    SELECT * FROM t20;
+    SELECT * FROM t20_audit;
+}
+expect {
+    1|hello!
+    inserted id=1
+}
+
+# View with WHERE clause
+@cross-check-integrity
+test instead-of-insert-filtered-view {
+    CREATE TABLE t21(id INTEGER PRIMARY KEY, val TEXT, active INTEGER);
+    INSERT INTO t21 VALUES(1, 'old', 0);
+    CREATE VIEW v21 AS SELECT id, val FROM t21 WHERE active = 1;
+    CREATE TRIGGER trv21 INSTEAD OF INSERT ON v21 BEGIN
+        INSERT INTO t21 VALUES(NEW.id, NEW.val, 1);
+    END;
+    INSERT INTO v21 VALUES(2, 'new');
+    SELECT * FROM v21;
+}
+expect {
+    2|new
+}
+
+# View with aggregate columns
+@cross-check-integrity
+test instead-of-insert-agg-view {
+    CREATE TABLE t22(x INTEGER);
+    INSERT INTO t22 VALUES(10);
+    INSERT INTO t22 VALUES(20);
+    CREATE VIEW v22 AS SELECT count(*) as cnt, sum(x) as total FROM t22;
+    CREATE TRIGGER trv22 INSTEAD OF INSERT ON v22 BEGIN
+        INSERT INTO t22 VALUES(NEW.cnt);
+    END;
+    INSERT INTO v22 VALUES(99, 88);
+    SELECT * FROM t22 ORDER BY x;
+}
+expect {
+    10
+    20
+    99
+}
+
+# INSTEAD OF INSERT with blob data
+@cross-check-integrity
+test instead-of-insert-blob {
+    CREATE TABLE t23(id INTEGER, data BLOB);
+    CREATE VIEW v23 AS SELECT * FROM t23;
+    CREATE TRIGGER trv23 INSTEAD OF INSERT ON v23 BEGIN
+        INSERT INTO t23 VALUES(NEW.id, NEW.data);
+    END;
+    INSERT INTO v23 VALUES(1, X'DEADBEEF');
+    SELECT id, hex(data) FROM t23;
+}
+expect {
+    1|DEADBEEF
+}
+
+# INSERT OR IGNORE into view propagates conflict resolution
+@cross-check-integrity
+test instead-of-insert-or-ignore {
+    CREATE TABLE t24(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v24 AS SELECT * FROM t24;
+    CREATE TRIGGER trv24 INSTEAD OF INSERT ON v24 BEGIN
+        INSERT INTO t24 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT OR IGNORE INTO v24 VALUES(1, 'first');
+    INSERT OR IGNORE INTO v24 VALUES(1, 'duplicate');
+    SELECT * FROM t24;
+}
+expect {
+    1|first
+}
+
+# INSERT OR REPLACE into view propagates conflict resolution
+@cross-check-integrity
+test instead-of-insert-or-replace {
+    CREATE TABLE t25(id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t25 VALUES(1, 'original');
+    CREATE VIEW v25 AS SELECT * FROM t25;
+    CREATE TRIGGER trv25 INSTEAD OF INSERT ON v25 BEGIN
+        INSERT INTO t25 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT OR REPLACE INTO v25 VALUES(1, 'replaced');
+    SELECT * FROM t25;
+}
+expect {
+    1|replaced
+}
+
+# SELECT-only trigger body (noop, nothing inserted)
+@cross-check-integrity
+test instead-of-insert-noop-body {
+    CREATE TABLE t26(x);
+    CREATE VIEW v26 AS SELECT * FROM t26;
+    CREATE TRIGGER trv26 INSTEAD OF INSERT ON v26 BEGIN
+        SELECT 1;
+    END;
+    INSERT INTO v26 VALUES(42);
+    SELECT count(*) FROM t26;
+}
+expect {
+    0
+}
+
+# INSTEAD OF INSERT with CAST expressions in VALUES
+@cross-check-integrity
+test instead-of-insert-cast {
+    CREATE TABLE t27(id INTEGER, name TEXT);
+    CREATE VIEW v27 AS SELECT * FROM t27;
+    CREATE TRIGGER trv27 INSTEAD OF INSERT ON v27 BEGIN
+        INSERT INTO t27 VALUES(NEW.id, NEW.name);
+    END;
+    INSERT INTO v27 VALUES(CAST('123' AS INTEGER), CAST(456 AS TEXT));
+    SELECT typeof(id), id, typeof(name), name FROM t27;
+}
+expect {
+    integer|123|text|456
+}
+
+# View with UNION ALL
+@cross-check-integrity
+test instead-of-insert-union-view {
+    CREATE TABLE u1(x);
+    CREATE TABLE u2(x);
+    INSERT INTO u1 VALUES(1);
+    INSERT INTO u2 VALUES(2);
+    CREATE VIEW vu AS SELECT x FROM u1 UNION ALL SELECT x FROM u2;
+    CREATE TRIGGER trvu INSTEAD OF INSERT ON vu BEGIN
+        INSERT INTO u1 VALUES(NEW.x);
+    END;
+    INSERT INTO vu VALUES(3);
+    SELECT * FROM vu ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# INSTEAD OF trigger on nonexistent view
+test instead-of-nonexistent-view {
+    CREATE TRIGGER bad INSTEAD OF INSERT ON nonexistent BEGIN SELECT 1; END;
+}
+expect error {
+    no such table
+}
+
+# RAISE(ABORT) in INSTEAD OF trigger fires correctly
+@cross-check-integrity
+test instead-of-insert-raise-abort {
+    CREATE TABLE t28(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v28 AS SELECT * FROM t28;
+    CREATE TRIGGER trv28 INSTEAD OF INSERT ON v28 WHEN NEW.id < 0 BEGIN
+        SELECT RAISE(ABORT, 'id must be non-negative');
+    END;
+    CREATE TRIGGER trv28b INSTEAD OF INSERT ON v28 WHEN NEW.id >= 0 BEGIN
+        INSERT INTO t28 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT INTO v28 VALUES(1, 'ok');
+    SELECT * FROM t28;
+}
+expect {
+    1|ok
+}
+
+# Constraint violation in trigger body propagates error
+test instead-of-insert-constraint-error {
+    CREATE TABLE t29(id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+    CREATE VIEW v29 AS SELECT * FROM t29;
+    CREATE TRIGGER trv29 INSTEAD OF INSERT ON v29 BEGIN
+        INSERT INTO t29 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT INTO v29 VALUES(1, NULL);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+# changes() returns 0 after INSTEAD OF INSERT (matching SQLite)
+test instead-of-insert-changes {
+    CREATE TABLE t30(x INTEGER);
+    CREATE VIEW v30 AS SELECT * FROM t30;
+    CREATE TRIGGER trv30 INSTEAD OF INSERT ON v30 BEGIN
+        INSERT INTO t30 VALUES(NEW.x);
+    END;
+    INSERT INTO v30 VALUES(1);
+    SELECT changes();
+}
+expect {
+    0
+}
+
+# Wrong number of values
+test instead-of-insert-wrong-count {
+    CREATE TABLE t31(a, b, c);
+    CREATE VIEW v31 AS SELECT * FROM t31;
+    CREATE TRIGGER trv31 INSTEAD OF INSERT ON v31 BEGIN
+        INSERT INTO t31 VALUES(NEW.a, NEW.b, NEW.c);
+    END;
+    INSERT INTO v31 VALUES(1, 2);
+}
+expect error {
+    3 columns but 2 values
+}
+
+# Multiple sequential inserts through same trigger
+@cross-check-integrity
+test instead-of-insert-sequential {
+    CREATE TABLE t32(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE VIEW v32 AS SELECT * FROM t32;
+    CREATE TRIGGER trv32 INSTEAD OF INSERT ON v32 BEGIN
+        INSERT INTO t32 VALUES(NEW.id, NEW.val);
+    END;
+    INSERT INTO v32 VALUES(1, 'first');
+    INSERT INTO v32 VALUES(2, 'second');
+    INSERT INTO v32 VALUES(3, 'third');
+    SELECT * FROM t32 ORDER BY id;
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
+
+# View with computed/aliased columns
+@cross-check-integrity
+test instead-of-insert-computed-view {
+    CREATE TABLE t33(a INTEGER, b INTEGER);
+    CREATE VIEW v33 AS SELECT a, b, a + b AS sum FROM t33;
+    CREATE TRIGGER trv33 INSTEAD OF INSERT ON v33 BEGIN
+        INSERT INTO t33 VALUES(NEW.a, NEW.b);
+    END;
+    INSERT INTO v33 VALUES(3, 4, 7);
+    SELECT * FROM v33;
+}
+expect {
+    3|4|7
+}
