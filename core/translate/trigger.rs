@@ -125,20 +125,50 @@ pub fn translate_create_trigger(
         bail_parse_error!("Trigger {} already exists", normalized_trigger_name);
     }
 
-    // Verify the table exists
-    let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
-    let Some(table) = table else {
-        bail_parse_error!("no such table: {}", normalized_table_name);
-    };
-    if table.virtual_table().is_some() {
-        bail_parse_error!("cannot create triggers on virtual tables");
-    }
-
-    if time
+    // Verify the table/view exists and is valid for this trigger type
+    let is_instead_of = time
         .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf);
+
+    if is_instead_of {
+        // INSTEAD OF triggers can only be created on views
+        let view = resolver.with_schema(database_id, |s| s.get_view(&normalized_table_name));
+        if view.is_none() {
+            let is_table = resolver.with_schema(database_id, |s| {
+                s.get_table(&normalized_table_name).is_some()
+            });
+            if is_table {
+                bail_parse_error!(
+                    "cannot create INSTEAD OF trigger on table: {}",
+                    normalized_table_name
+                );
+            }
+            bail_parse_error!("no such table: {}", normalized_table_name);
+        }
+    } else {
+        // BEFORE/AFTER triggers can only be created on tables (not views)
+        let table = resolver.with_schema(database_id, |s| s.get_table(&normalized_table_name));
+        let Some(table) = table else {
+            let is_view = resolver.with_schema(database_id, |s| {
+                s.get_view(&normalized_table_name).is_some()
+            });
+            if is_view {
+                let time_str = match time.as_ref() {
+                    Some(ast::TriggerTime::Before) => "BEFORE",
+                    Some(ast::TriggerTime::After) => "AFTER",
+                    _ => "BEFORE",
+                };
+                bail_parse_error!(
+                    "cannot create {} trigger on view: {}",
+                    time_str,
+                    normalized_table_name
+                );
+            }
+            bail_parse_error!("no such table: {}", normalized_table_name);
+        };
+        if table.virtual_table().is_some() {
+            bail_parse_error!("cannot create triggers on virtual tables");
+        }
     }
 
     if temporary {
