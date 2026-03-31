@@ -386,6 +386,7 @@ pub fn emit_program_for_update(
         resolver,
         returning_buffer.as_ref(),
         &mut update_subqueries,
+        any_replace,
     )?;
 
     // Close the main loop
@@ -790,6 +791,7 @@ fn emit_update_insns<'a>(
     resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
+    any_replace: bool,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
@@ -2174,7 +2176,9 @@ fn emit_update_insns<'a>(
             // If Phase 1 REPLACE deleted a parent row referenced by deferred FK children,
             // the counter was incremented. Now that the new row is inserted with the
             // (potentially same) parent key, scan children and decrement.
-            if connection.foreign_keys_enabled() {
+            // Only emit when REPLACE can actually fire; the OLD/NEW passes in
+            // emit_fk_parent_pk_change_counters already handle non-REPLACE updates.
+            if connection.foreign_keys_enabled() && any_replace {
                 emit_fk_parent_new_key_reconcile(
                     program,
                     table,
