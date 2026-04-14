@@ -18,18 +18,21 @@ use crate::{
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
         run_stmt_expect_one_row, run_stmt_ignore_rows, DatabaseChangesIteratorMode,
-        DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape, DatabaseWalSession,
+        DatabaseChangesIteratorOpts, DatabaseReplaySession, DatabaseReplaySessionOpts,
+        DatabaseTape, DatabaseWalSession,
     },
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
-        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt, StmtResult, StreamRequest,
+        self, Batch, BatchCond, BatchStep, BatchStreamReq, LogicalOp, LogicalOpType,
+        LogicalTxnData, PageData, PageUpdatesEncodingReq, PullUpdatesReqProtoBody,
+        PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
-        Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
-        DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo,
-        DbSyncStatus, PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
+        parse_bin_record, Coro, DatabasePullRevision, DatabaseRowTransformResult,
+        DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
+        DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
+        PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -39,6 +42,132 @@ pub const WAL_HEADER: usize = 32;
 pub const WAL_FRAME_HEADER: usize = 24;
 pub const PAGE_SIZE: usize = 4096;
 pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
+
+fn pull_updates_stream_kind(header: &PullUpdatesRespProtoBody) -> Result<PullUpdatesStreamKind> {
+    PullUpdatesStreamKind::try_from(header.stream_kind).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!(
+            "unknown pull-updates stream kind: {}",
+            header.stream_kind
+        ))
+    })
+}
+
+fn ensure_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Result<()> {
+    match pull_updates_stream_kind(header)? {
+        PullUpdatesStreamKind::Pages => Ok(()),
+        PullUpdatesStreamKind::Logical => Err(Error::DatabaseSyncEngineError(format!(
+            "{context} does not support logical pull-updates streams yet"
+        ))),
+    }
+}
+
+fn logical_op_to_tape_operations(
+    op: LogicalOp,
+    commit_ts: u64,
+) -> Result<Vec<DatabaseTapeOperation>> {
+    let op_type = LogicalOpType::try_from(op.op_type).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!("unknown logical op type: {}", op.op_type))
+    })?;
+    match op_type {
+        LogicalOpType::UpsertRow => {
+            if op.table_name.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical upsert_row must include table_name".to_string(),
+                ));
+            }
+            if op.record.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical upsert_row must include record bytes".to_string(),
+                ));
+            }
+            Ok(vec![DatabaseTapeOperation::RowChange(
+                DatabaseTapeRowChange {
+                    change_id: 0,
+                    change_time: commit_ts,
+                    change: DatabaseTapeRowChangeType::Insert {
+                        after: parse_bin_record(op.record.to_vec())?,
+                    },
+                    table_name: op.table_name,
+                    id: op.rowid,
+                },
+            )])
+        }
+        LogicalOpType::DeleteRow => {
+            if op.table_name.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical delete_row must include table_name".to_string(),
+                ));
+            }
+            Ok(vec![DatabaseTapeOperation::RowChange(
+                DatabaseTapeRowChange {
+                    change_id: 0,
+                    change_time: commit_ts,
+                    change: DatabaseTapeRowChangeType::Delete { before: Vec::new() },
+                    table_name: op.table_name,
+                    id: op.rowid,
+                },
+            )])
+        }
+        LogicalOpType::SchemaDdl => {
+            if op.sql.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical schema_ddl must include sql".to_string(),
+                ));
+            }
+            Ok(vec![DatabaseTapeOperation::StmtReplay(
+                DatabaseStatementReplay {
+                    sql: op.sql,
+                    values: Vec::new(),
+                },
+            )])
+        }
+        LogicalOpType::UpdateHeader => {
+            let mut operations = Vec::with_capacity(2);
+            if let Some(user_version) = op.user_version {
+                operations.push(DatabaseTapeOperation::StmtReplay(DatabaseStatementReplay {
+                    sql: format!("PRAGMA user_version = {user_version}"),
+                    values: Vec::new(),
+                }));
+            }
+            if let Some(application_id) = op.application_id {
+                operations.push(DatabaseTapeOperation::StmtReplay(DatabaseStatementReplay {
+                    sql: format!("PRAGMA application_id = {application_id}"),
+                    values: Vec::new(),
+                }));
+            }
+            if operations.is_empty() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "logical update_header must include at least one field".to_string(),
+                ));
+            }
+            Ok(operations)
+        }
+    }
+}
+
+pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<DatabaseTapeOperation>> {
+    let mut operations = Vec::new();
+    for op in txn.ops.iter().cloned() {
+        operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
+    }
+    Ok(operations)
+}
+
+pub async fn apply_logical_transactions<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns: &[LogicalTxnData],
+) -> Result<()> {
+    for txn in txns {
+        for operation in logical_txn_to_tape_operations(txn)? {
+            replay.replay(coro, operation).await?;
+        }
+    }
+    if !txns.is_empty() {
+        replay.replay(coro, DatabaseTapeOperation::Commit).await?;
+    }
+    Ok(())
+}
 
 pub struct MutexSlot<T: Clone> {
     pub value: T,
@@ -300,6 +429,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
+        logical_updates: false,
         server_revision: String::new(),
         client_revision: revision.to_string(),
         long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_millis() as u32).unwrap_or(0),
@@ -331,6 +461,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!("wal_pull_to_file: got header={:?}", header);
+    ensure_page_stream(&header, "wal_pull_to_file")?;
 
     let mut offset = 0;
     #[allow(clippy::arc_with_non_send_sync)]
@@ -429,6 +560,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
+        logical_updates: false,
         server_revision: server_revision.to_string(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
@@ -460,6 +592,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!("pull_pages_v1: got header={:?}", header);
+    ensure_page_stream(&header, "pull_pages_v1")?;
 
     let mut pages = Vec::with_capacity(pages.len());
 
@@ -1273,6 +1406,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
+        logical_updates: false,
         server_revision: String::new(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
@@ -1309,6 +1443,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
         main_db_path,
         header
     );
+    ensure_page_stream(&header, "bootstrap_db_file")?;
     let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
     let c = Completion::new_trunc(move |result| {
         let Ok(rc) = result else {
@@ -1715,16 +1850,24 @@ pub async fn wait_all_results<Ctx, T: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, sync::Arc};
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;
+    use tempfile::NamedTempFile;
 
     use crate::{
         database_sync_engine::DataStats,
         database_sync_engine_io::{DataCompletion, DataPollResult},
-        database_sync_operations::wait_proto_message,
-        server_proto::PageData,
+        database_sync_operations::{
+            apply_logical_transactions, logical_txn_to_tape_operations, wait_proto_message,
+        },
+        database_tape::run_stmt_once,
+        database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
+        server_proto::{
+            LogicalOp, LogicalOpType, LogicalTxnData, PageData, PullUpdatesRespProtoBody,
+            PullUpdatesStreamKind,
+        },
         types::Coro,
         Result,
     };
@@ -1814,5 +1957,208 @@ mod tests {
     fn test_remote_encryption_key_header_constant() {
         use super::ENCRYPTION_KEY_HEADER;
         assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
+    }
+
+    fn text_value(value: &str) -> turso_core::Value {
+        turso_core::Value::Text(turso_core::types::Text::new(value.to_owned()))
+    }
+
+    fn record(values: &[turso_core::Value]) -> Bytes {
+        turso_core::types::ImmutableRecord::from_values(values.iter(), values.len())
+            .into_payload()
+            .into()
+    }
+
+    #[test]
+    fn logical_header_round_trips_stream_kind() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "rev".to_string(),
+            db_size: 0,
+            raw_encoding: Some(crate::server_proto::PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Logical as i32,
+        };
+        let decoded = PullUpdatesRespProtoBody::decode_length_delimited(
+            header.encode_length_delimited_to_vec().as_slice(),
+        )
+        .unwrap();
+        assert_eq!(decoded.stream_kind, PullUpdatesStreamKind::Logical as i32);
+    }
+
+    #[test]
+    fn logical_txn_to_tape_operations_expands_header_updates() {
+        let txn = LogicalTxnData {
+            end_offset: 7,
+            commit_ts: 11,
+            ops: vec![LogicalOp {
+                op_type: LogicalOpType::UpdateHeader as i32,
+                table_name: String::new(),
+                rowid: 0,
+                record: Bytes::new(),
+                sql: String::new(),
+                user_version: Some(5),
+                application_id: Some(9),
+            }],
+        };
+        let ops = logical_txn_to_tape_operations(&txn).unwrap();
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn apply_logical_transactions_replays_schema_and_rowid_upserts() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Arc::new(DatabaseTape::new(
+            turso_core::Database::open_file(io.clone(), &db_path).unwrap(),
+        ));
+
+        let create_and_seed = LogicalTxnData {
+            end_offset: 128,
+            commit_ts: 1,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(a TEXT, b TEXT)".to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[text_value("a"), text_value("one")]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+        let alter_and_update = LogicalTxnData {
+            end_offset: 256,
+            commit_ts: 2,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::UpdateHeader as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: String::new(),
+                    user_version: Some(77),
+                    application_id: Some(99),
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "ALTER TABLE t ADD COLUMN c TEXT DEFAULT NULL".to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[text_value("a"), text_value("ONE"), text_value("c1")]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 2,
+                    record: record(&[text_value("b"), text_value("two"), text_value("c2")]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::DeleteRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 2,
+                    record: Bytes::new(),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+                    let mut replay = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    apply_logical_transactions(
+                        &coro,
+                        &mut replay,
+                        &[create_and_seed, alter_and_update],
+                    )
+                    .await
+                    .unwrap();
+
+                    let conn = db.connect_untracked().unwrap();
+                    let mut rows = Vec::new();
+                    let mut stmt = conn
+                        .prepare("SELECT rowid, a, b, c FROM t ORDER BY rowid")
+                        .unwrap();
+                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    assert_eq!(
+                        rows,
+                        vec![vec![
+                            turso_core::Value::from_i64(1),
+                            text_value("a"),
+                            text_value("ONE"),
+                            text_value("c1"),
+                        ]]
+                    );
+
+                    let mut pragma = conn.prepare("PRAGMA user_version").unwrap();
+                    let user_version = run_stmt_once(&coro, &mut pragma)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .get::<i64>(0)
+                        .unwrap();
+                    assert_eq!(user_version, 77);
+
+                    let mut pragma = conn.prepare("PRAGMA application_id").unwrap();
+                    let application_id = run_stmt_once(&coro, &mut pragma)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .get::<i64>(0)
+                        .unwrap();
+                    assert_eq!(application_id, 99);
+                    Result::Ok(())
+                }
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
     }
 }

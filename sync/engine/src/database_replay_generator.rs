@@ -432,9 +432,20 @@ impl DatabaseReplayGenerator {
         let original_column_names = insert_columns.clone();
         insert_columns.push("rowid".to_string());
 
+        let rowid_conflict_clause = if record_columns.is_empty() {
+            " ON CONFLICT DO NOTHING".to_string()
+        } else {
+            let mut update_clauses = Vec::with_capacity(record_columns.len());
+            for name in record_columns {
+                update_clauses.push(format!("{name} = excluded.{name}"));
+            }
+            format!(" ON CONFLICT DO UPDATE SET {}", update_clauses.join(","))
+        };
         let placeholders = ["?"].repeat(columns + 1).join(",");
         let col_list = insert_columns.join(", ");
-        let query = format!("INSERT INTO {table_name}({col_list}) VALUES ({placeholders})");
+        let query = format!(
+            "INSERT INTO {table_name}({col_list}) VALUES ({placeholders}){rowid_conflict_clause}"
+        );
         Ok(ReplayInfo {
             change_type: DatabaseChangeType::Insert,
             query,

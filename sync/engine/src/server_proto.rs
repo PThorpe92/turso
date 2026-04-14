@@ -17,6 +17,9 @@ pub struct PullUpdatesReqProtoBody {
     /// requested encoding of the pages
     #[prost(enumeration = "PageUpdatesEncodingReq", tag = "1")]
     pub encoding: i32,
+    /// request decoded logical MVCC updates instead of raw logical-log bytes
+    #[prost(bool, tag = "8")]
+    pub logical_updates: bool,
     /// revision of the requested pages on server side; can be None - in which case server will pick latest revision
     #[prost(string, tag = "2")]
     pub server_revision: String,
@@ -48,6 +51,50 @@ pub struct PageData {
     pub encoded_page: Bytes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum PullUpdatesStreamKind {
+    Pages = 0,
+    Logical = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum LogicalOpType {
+    UpsertRow = 0,
+    DeleteRow = 1,
+    SchemaDdl = 2,
+    UpdateHeader = 3,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+pub struct LogicalOp {
+    #[prost(enumeration = "LogicalOpType", tag = "1")]
+    pub op_type: i32,
+    #[prost(string, tag = "2")]
+    pub table_name: String,
+    #[prost(sint64, tag = "3")]
+    pub rowid: i64,
+    #[prost(bytes, tag = "4")]
+    pub record: Bytes,
+    #[prost(string, tag = "5")]
+    pub sql: String,
+    #[prost(optional, uint32, tag = "6")]
+    pub user_version: Option<u32>,
+    #[prost(optional, uint32, tag = "7")]
+    pub application_id: Option<u32>,
+}
+
+#[derive(prost::Message, Clone, PartialEq, Eq)]
+pub struct LogicalTxnData {
+    #[prost(uint64, tag = "1")]
+    pub end_offset: u64,
+    #[prost(uint64, tag = "2")]
+    pub commit_ts: u64,
+    #[prost(message, repeated, tag = "3")]
+    pub ops: Vec<LogicalOp>,
+}
+
 #[derive(prost::Message)]
 pub struct PageSetRawEncodingProto {}
 
@@ -70,6 +117,8 @@ pub struct PullUpdatesRespProtoBody {
     pub raw_encoding: Option<PageSetRawEncodingProto>,
     #[prost(optional, message, tag = "4")]
     pub zstd_encoding: Option<PageSetZstdEncodingProto>,
+    #[prost(enumeration = "PullUpdatesStreamKind", tag = "5")]
+    pub stream_kind: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
