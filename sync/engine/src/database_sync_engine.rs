@@ -15,9 +15,10 @@ use crate::{
     database_sync_operations::{
         acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
         count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
-        reset_wal_file, update_last_change_id, wait_all_results, wal_apply_from_file,
-        wal_pull_to_file, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
-        WAL_FRAME_SIZE,
+        reset_wal_file, update_last_change_id, wait_all_results,
+        wal_apply_from_file, wal_pull_to_file, apply_logical_transactions_without_commit,
+        pull_updates_v1, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
+        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
@@ -50,6 +51,8 @@ pub struct DatabaseSyncEngineOpts {
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<String>,
+    /// Opt into decoded logical MVCC pull-updates streams when the server supports them.
+    pub logical_mvcc_pull: bool,
 }
 
 pub struct DataStats {
@@ -776,16 +779,73 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
-        let next_revision = wal_pull_to_file(
-            ctx,
-            &file.value,
-            &revision,
-            self.opts.wal_pull_batch_size,
-            self.opts.long_poll_timeout,
-        )
-        .await?;
+        let mut logical_txns = None;
+        let next_revision = if self.opts.logical_mvcc_pull {
+            match &revision {
+                Some(DatabasePullRevision::V1 { revision }) => {
+                    match pull_updates_v1(
+                        ctx,
+                        &file.value,
+                        revision,
+                        self.opts.long_poll_timeout,
+                        true,
+                    )
+                    .await?
+                    {
+                        (next_revision, PullUpdatesV1Result::Pages) => next_revision,
+                        (next_revision, PullUpdatesV1Result::Logical(txns)) => {
+                            logical_txns = Some(txns);
+                            next_revision
+                        }
+                    }
+                }
+                None => match pull_updates_v1(
+                    ctx,
+                    &file.value,
+                    "",
+                    self.opts.long_poll_timeout,
+                    true,
+                )
+                .await?
+                {
+                    (next_revision, PullUpdatesV1Result::Pages) => next_revision,
+                    (next_revision, PullUpdatesV1Result::Logical(txns)) => {
+                        logical_txns = Some(txns);
+                        next_revision
+                    }
+                },
+                Some(DatabasePullRevision::Legacy { .. }) => {
+                    wal_pull_to_file(
+                        ctx,
+                        &file.value,
+                        &revision,
+                        self.opts.wal_pull_batch_size,
+                        self.opts.long_poll_timeout,
+                    )
+                    .await?
+                }
+            }
+        } else {
+            wal_pull_to_file(
+                ctx,
+                &file.value,
+                &revision,
+                self.opts.wal_pull_batch_size,
+                self.opts.long_poll_timeout,
+            )
+            .await?
+        };
 
-        if file.value.size()? == 0 {
+        let file_slot = if logical_txns.is_some() {
+            None
+        } else if file.value.size()? == 0 {
+            None
+        } else {
+            Some(file)
+        };
+        let logical_txns = logical_txns.filter(|txns| !txns.is_empty());
+
+        if file_slot.is_none() && logical_txns.is_none() {
             tracing::info!(
                 "wait_changes(path={}): no changes detected",
                 self.main_db_path
@@ -794,6 +854,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 time: now,
                 revision: next_revision,
                 file_slot: None,
+                logical_txns: None,
             });
         }
 
@@ -807,7 +868,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Ok(DbChangesStatus {
             time: now,
             revision: next_revision,
-            file_slot: Some(file),
+            file_slot,
+            logical_txns,
         })
     }
 
@@ -819,16 +881,33 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         coro: &Coro<Ctx>,
         remote_changes: DbChangesStatus,
     ) -> Result<()> {
-        if remote_changes.file_slot.is_none() {
+        if remote_changes.is_empty() {
             self.update_meta(coro, |m| {
                 m.last_pull_unix_time = Some(remote_changes.time.secs);
             })
             .await?;
             return Ok(());
         }
-        assert!(remote_changes.file_slot.is_some(), "file_slot must be set");
-        let changes_file = remote_changes.file_slot.as_ref().unwrap().value.clone();
-        let pull_result = self.apply_changes_internal(coro, &changes_file).await;
+        let pull_result = match (
+            remote_changes.file_slot.as_ref(),
+            remote_changes.logical_txns.as_ref(),
+        ) {
+            (Some(changes_file), None) => {
+                self.apply_changes_internal(coro, Some(&changes_file.value), None)
+                    .await
+            }
+            (None, Some(logical_txns)) => {
+                self.apply_changes_internal(coro, None, Some(logical_txns))
+                    .await
+            }
+            (None, None) => unreachable!("empty remote changes handled above"),
+            (Some(_), Some(_)) => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "remote changes must not contain both WAL frames and logical transactions"
+                        .to_string(),
+                ))
+            }
+        };
         let Ok(revert_since_wal_watermark) = pull_result else {
             return Err(pull_result.err().unwrap());
         };
@@ -852,7 +931,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     async fn apply_changes_internal<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        changes_file: &Arc<dyn turso_core::File>,
+        changes_file: Option<&Arc<dyn turso_core::File>>,
+        logical_txns: Option<&Vec<crate::server_proto::LogicalTxnData>>,
     ) -> Result<u64> {
         tracing::info!("apply_changes(path={})", self.main_db_path);
 
@@ -917,12 +997,49 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
 
         // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
-        let db_size = wal_apply_from_file(coro, changes_file, &mut main_session).await?;
-        tracing::info!(
-            "apply_changes(path={}): applied changes from remote: db_size={}",
-            self.main_db_path,
-            db_size,
-        );
+        match (changes_file, logical_txns) {
+            (Some(changes_file), None) => {
+                let db_size = wal_apply_from_file(coro, changes_file, &mut main_session).await?;
+                tracing::info!(
+                    "apply_changes(path={}): applied changes from remote: db_size={}",
+                    self.main_db_path,
+                    db_size,
+                );
+            }
+            (None, Some(logical_txns)) => {
+                let mut replay = DatabaseReplaySession {
+                    conn: main_conn.clone(),
+                    cached_delete_stmt: HashMap::new(),
+                    cached_insert_stmt: HashMap::new(),
+                    cached_update_stmt: HashMap::new(),
+                    in_txn: true,
+                    generator: DatabaseReplayGenerator {
+                        conn: main_conn.clone(),
+                        opts: DatabaseReplaySessionOpts {
+                            use_implicit_rowid: false,
+                        },
+                    },
+                };
+                apply_logical_transactions_without_commit(coro, &mut replay, logical_txns)
+                    .await?;
+                tracing::info!(
+                    "apply_changes(path={}): applied {} logical transactions from remote",
+                    self.main_db_path,
+                    logical_txns.len(),
+                );
+            }
+            (Some(_), Some(_)) => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "remote apply source must be either WAL frames or logical transactions"
+                        .to_string(),
+                ))
+            }
+            (None, None) => {
+                return Err(Error::DatabaseSyncEngineError(
+                    "remote apply source must not be empty".to_string(),
+                ))
+            }
+        }
 
         main_session.commit(0)?;
         // now DB is equivalent to the some remote state (all local changes reverted, all remote changes applied)

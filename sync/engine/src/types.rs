@@ -5,7 +5,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
+use crate::{
+    database_sync_operations::MutexSlot, errors::Error, server_proto::LogicalTxnData, Result,
+};
 
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,
@@ -76,6 +78,13 @@ pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub logical_txns: Option<Vec<LogicalTxnData>>,
+}
+
+impl DbChangesStatus {
+    pub fn is_empty(&self) -> bool {
+        self.file_slot.is_none() && self.logical_txns.is_none()
+    }
 }
 
 impl std::fmt::Debug for DbChangesStatus {
@@ -84,6 +93,10 @@ impl std::fmt::Debug for DbChangesStatus {
             .field("time", &self.time)
             .field("revision", &self.revision)
             .field("file_slot.is_some()", &self.file_slot.is_some())
+            .field(
+                "logical_txns.len()",
+                &self.logical_txns.as_ref().map(std::vec::Vec::len),
+            )
             .finish()
     }
 }

@@ -108,7 +108,7 @@ pub struct TursoDatabaseSyncChanges {
 
 impl TursoDatabaseSyncChanges {
     pub fn empty(&self) -> bool {
-        self.changes.file_slot.is_none()
+        self.changes.is_empty()
     }
     pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_sync_changes_t {
         Box::into_raw(self) as *mut capi::c::turso_sync_changes_t
@@ -224,6 +224,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
+            logical_mvcc_pull: false,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {

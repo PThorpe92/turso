@@ -153,20 +153,37 @@ pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<Databa
     Ok(operations)
 }
 
-pub async fn apply_logical_transactions<Ctx>(
+async fn replay_logical_transactions<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
     txns: &[LogicalTxnData],
+    commit_at_end: bool,
 ) -> Result<()> {
     for txn in txns {
         for operation in logical_txn_to_tape_operations(txn)? {
             replay.replay(coro, operation).await?;
         }
     }
-    if !txns.is_empty() {
+    if commit_at_end && !txns.is_empty() {
         replay.replay(coro, DatabaseTapeOperation::Commit).await?;
     }
     Ok(())
+}
+
+pub async fn apply_logical_transactions<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns: &[LogicalTxnData],
+) -> Result<()> {
+    replay_logical_transactions(coro, replay, txns, true).await
+}
+
+pub async fn apply_logical_transactions_without_commit<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns: &[LogicalTxnData],
+) -> Result<()> {
+    replay_logical_transactions(coro, replay, txns, false).await
 }
 
 pub struct MutexSlot<T: Clone> {
@@ -231,6 +248,12 @@ enum WalHttpPullResult<C: DataCompletion<u8>> {
 pub enum WalPushResult {
     Ok { baton: Option<String> },
     NeedCheckpoint,
+}
+
+#[derive(Debug)]
+pub enum PullUpdatesV1Result {
+    Pages,
+    Logical(Vec<LogicalTxnData>),
 }
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
@@ -524,6 +547,146 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
     })
+}
+
+pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    frames_file: &Arc<dyn turso_core::File>,
+    revision: &str,
+    long_poll_timeout: Option<std::time::Duration>,
+    logical_updates: bool,
+) -> Result<(DatabasePullRevision, PullUpdatesV1Result)> {
+    tracing::info!("pull_updates_v1: revision={revision}, logical_updates={logical_updates}");
+    let mut bytes = BytesMut::new();
+
+    let request = PullUpdatesReqProtoBody {
+        encoding: PageUpdatesEncodingReq::Raw as i32,
+        logical_updates,
+        server_revision: String::new(),
+        client_revision: revision.to_string(),
+        long_poll_timeout_ms: long_poll_timeout.map(|x| x.as_millis() as u32).unwrap_or(0),
+        server_pages_selector: BytesMut::new().into(),
+        server_query_selector: String::new(),
+        client_pages: BytesMut::new().into(),
+    };
+    let request = request.encode_to_vec();
+    ctx.io.network_stats.write(request.len());
+    let completion = ctx.http(
+        "POST",
+        "/pull-updates",
+        Some(request),
+        &[
+            ("content-type", "application/protobuf"),
+            ("accept-encoding", "application/protobuf"),
+        ],
+    )?;
+    let Some(header) = wait_proto_message::<Ctx, PullUpdatesRespProtoBody>(
+        ctx.coro,
+        &completion,
+        &ctx.io.network_stats,
+        &mut bytes,
+    )
+    .await?
+    else {
+        return Err(Error::DatabaseSyncEngineError(
+            "no header returned in the pull-updates protobuf call".to_string(),
+        ));
+    };
+    tracing::info!("pull_updates_v1: got header={:?}", header);
+
+    let next_revision = DatabasePullRevision::V1 {
+        revision: header.server_revision.clone(),
+    };
+    match pull_updates_stream_kind(&header)? {
+        PullUpdatesStreamKind::Pages => {
+            let c = Completion::new_trunc(move |result| {
+                let Ok(rc) = result else {
+                    return;
+                };
+                assert!(rc as usize == 0);
+            });
+            let c = frames_file.truncate(0, c)?;
+            while !c.succeeded() {
+                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+            }
+
+            let mut offset = 0;
+            #[allow(clippy::arc_with_non_send_sync)]
+            let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
+
+            let mut page_data_opt = wait_proto_message::<Ctx, PageData>(
+                ctx.coro,
+                &completion,
+                &ctx.io.network_stats,
+                &mut bytes,
+            )
+            .await?;
+            while let Some(page_data) = page_data_opt.take() {
+                let page_id = page_data.page_id;
+                tracing::debug!("received page {}", page_id);
+                let page = decode_page(&header, page_data)?;
+                if page.len() != PAGE_SIZE {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "page has unexpected size: {} != {}",
+                        page.len(),
+                        PAGE_SIZE
+                    )));
+                }
+                buffer.as_mut_slice()[WAL_FRAME_HEADER..].copy_from_slice(&page);
+                page_data_opt = wait_proto_message(
+                    ctx.coro,
+                    &completion,
+                    &ctx.io.network_stats,
+                    &mut bytes,
+                )
+                .await?;
+                let mut frame_info = WalFrameInfo {
+                    db_size: 0,
+                    page_no: page_id as u32 + 1,
+                };
+                if page_data_opt.is_none() {
+                    frame_info.db_size = header.db_size as u32;
+                }
+                tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
+                frame_info.put_to_frame_header(buffer.as_mut_slice());
+
+                let c = Completion::new_write(move |result| {
+                    let Ok(size) = result else {
+                        return;
+                    };
+                    assert!(size as usize == WAL_FRAME_SIZE);
+                });
+
+                let c = frames_file.pwrite(offset, buffer.clone(), c)?;
+                while !c.succeeded() {
+                    ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+                }
+                offset += WAL_FRAME_SIZE as u64;
+            }
+
+            let c = Completion::new_sync(move |_| {});
+            let c = frames_file.sync(c, FileSyncType::Fsync)?;
+            while !c.succeeded() {
+                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+            }
+
+            Ok((next_revision, PullUpdatesV1Result::Pages))
+        }
+        PullUpdatesStreamKind::Logical => {
+            let mut txns = Vec::new();
+            while let Some(txn) = wait_proto_message::<Ctx, LogicalTxnData>(
+                ctx.coro,
+                &completion,
+                &ctx.io.network_stats,
+                &mut bytes,
+            )
+            .await?
+            {
+                txns.push(txn);
+            }
+            Ok((next_revision, PullUpdatesV1Result::Logical(txns)))
+        }
+    }
 }
 
 #[derive(Debug)]
