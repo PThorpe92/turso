@@ -1314,6 +1314,14 @@ impl Connection {
         Ok(())
     }
 
+    /// Publish the connection's current schema snapshot to the shared database
+    /// cache after a successful commit so other live connections can refresh.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn publish_schema_if_newer(&self) {
+        let schema = self.schema.read().clone();
+        self.db.update_schema_if_newer(schema);
+    }
+
     /// Try to read page with given ID with fixed WAL watermark position
     /// This method return false if page is not found (so, this is probably new page created after watermark position which wasn't checkpointed to the DB file yet)
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]

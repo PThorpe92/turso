@@ -15,8 +15,8 @@ use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
     BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
     ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq,
-    PipelineReqBody, PipelineRespBody, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Row,
-    StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
+    PipelineReqBody, PipelineRespBody, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+    PullUpdatesStreamKind, Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
 
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -549,6 +549,7 @@ impl TursoSyncServer {
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
         };
 
         let mut response_body = Vec::new();
