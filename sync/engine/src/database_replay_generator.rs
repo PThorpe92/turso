@@ -489,32 +489,78 @@ impl DatabaseReplayGenerator {
         })
     }
 
-    /// Execute a DDL statement idempotently: for CREATE TABLE statements,
-    /// check which columns already exist and only ALTER TABLE ADD COLUMN
-    /// for missing ones. Falls back to direct execution for non-CREATE TABLE DDL.
+    /// Execute a DDL statement idempotently.
+    ///
+    /// For `ALTER TABLE .. ADD COLUMN`, skip the statement if the column already
+    /// exists. For `CREATE TABLE`, if the table already exists, compare the
+    /// declared columns and `ALTER TABLE .. ADD COLUMN` any columns that are
+    /// missing locally. Falls back to direct execution for other DDL.
     pub async fn execute_ddl_idempotent<Ctx>(&self, coro: &Coro<Ctx>, ddl: &str) -> Result<()> {
         let mut parser = Parser::new(ddl.as_bytes());
-        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
-            turso_parser::ast::AlterTable {
-                name: tbl_name,
-                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
-            },
-        )))) = parser.next()
-        else {
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(stmt))) = parser.next() else {
             self.conn.execute(ddl)?;
             return Ok(());
         };
-        let table_name = tbl_name.name.as_str();
-        let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
-        let col_name = col_def.col_name.as_str();
-        if current_columns.iter().any(|c| c == col_name) {
-            tracing::debug!(
-                "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
-            );
-            return Ok(());
+        match stmt {
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
+            }) => {
+                let table_name = tbl_name.name.as_str();
+                let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
+                let col_name = col_def.col_name.as_str();
+                if current_columns.iter().any(|c| c == col_name) {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
+                    );
+                    return Ok(());
+                }
+                self.conn.execute(ddl)?;
+                Ok(())
+            }
+            turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
+                let table_name = tbl_name.name.as_str();
+                let table_exists = self
+                    .conn
+                    .prepare(format!(
+                        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{table_name}'"
+                    ))?
+                    .run_collect_rows()?
+                    .into_iter()
+                    .next()
+                    .is_some();
+                if !table_exists {
+                    self.conn.execute(ddl)?;
+                    return Ok(());
+                }
+
+                let turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body
+                else {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: table {table_name} already exists and CREATE TABLE AS SELECT cannot be reconciled; skipping"
+                    );
+                    return Ok(());
+                };
+
+                let (current_columns, _) = self.table_columns_info(coro, table_name).await?;
+                for col_def in columns {
+                    let col_name = col_def.col_name.as_str();
+                    if current_columns.iter().any(|c| c == col_name) {
+                        continue;
+                    }
+                    let alter_sql = format!("ALTER TABLE {table_name} ADD COLUMN {col_def}");
+                    tracing::debug!(
+                        "execute_ddl_idempotent: add missing column {col_name} to {table_name} via {alter_sql}"
+                    );
+                    self.conn.execute(alter_sql)?;
+                }
+                Ok(())
+            }
+            _ => {
+                self.conn.execute(ddl)?;
+                Ok(())
+            }
         }
-        self.conn.execute(ddl)?;
-        Ok(())
     }
 
     async fn table_columns_info<Ctx>(

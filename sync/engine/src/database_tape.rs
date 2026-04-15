@@ -540,6 +540,14 @@ pub struct DatabaseReplaySession {
     pub(crate) generator: DatabaseReplayGenerator,
 }
 
+impl DatabaseReplaySession {
+    fn clear_cached_statements(&mut self) {
+        self.cached_delete_stmt.clear();
+        self.cached_insert_stmt.clear();
+        self.cached_update_stmt.clear();
+    }
+}
+
 async fn replay_stmt<Ctx>(
     coro: &Coro<Ctx>,
     stmt: &mut turso_core::Statement,
@@ -571,8 +579,16 @@ impl DatabaseReplaySession {
                 }
             }
             DatabaseTapeOperation::StmtReplay(replay) => {
-                let mut stmt = self.conn.prepare(&replay.sql)?;
-                replay_stmt(coro, &mut stmt, replay.values).await?;
+                self.clear_cached_statements();
+                if replay.values.is_empty() {
+                    self.generator
+                        .execute_ddl_idempotent(coro, &replay.sql)
+                        .await?;
+                } else {
+                    let mut stmt = self.conn.prepare(&replay.sql)?;
+                    replay_stmt(coro, &mut stmt, replay.values).await?;
+                }
+                self.clear_cached_statements();
                 return Ok(());
             }
             DatabaseTapeOperation::RowChange(change) => {

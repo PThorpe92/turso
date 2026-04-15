@@ -849,7 +849,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Some(file)
         };
         let logical_txns = logical_txns.filter(|txns| !txns.is_empty());
-
         if file_slot.is_none() && logical_txns.is_none() {
             tracing::info!(
                 "wait_changes(path={}): no changes detected",
@@ -1002,6 +1001,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
 
         // Phase 2: after revert DB has no local changes in its latest state - so its safe to apply changes from remote
+        let mut logical_replay_conn = None;
         match (changes_file, logical_txns) {
             (Some(changes_file), None) => {
                 let db_size = wal_apply_from_file(coro, changes_file, &mut main_session).await?;
@@ -1012,16 +1012,26 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 );
             }
             (None, Some(logical_txns)) => {
+                // Persist the rolled-back raw WAL state first. Logical MVCC replay
+                // must then run on a regular SQL transaction, not inside the raw
+                // WAL-insert session.
+                main_session.commit(0)?;
+                main_conn.end_nested();
+                main_session.wal_session.end(true)?;
+                main_conn.publish_schema_if_newer();
+
+                let conn = connect_untracked(&self.main_tape)?;
+                conn.execute("BEGIN IMMEDIATE")?;
                 let mut replay = DatabaseReplaySession {
-                    conn: main_conn.clone(),
+                    conn: conn.clone(),
                     cached_delete_stmt: HashMap::new(),
                     cached_insert_stmt: HashMap::new(),
                     cached_update_stmt: HashMap::new(),
                     in_txn: true,
                     generator: DatabaseReplayGenerator {
-                        conn: main_conn.clone(),
+                        conn: conn.clone(),
                         opts: DatabaseReplaySessionOpts {
-                            use_implicit_rowid: false,
+                            use_implicit_rowid: true,
                         },
                     },
                 };
@@ -1031,6 +1041,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     self.main_db_path,
                     logical_txns.len(),
                 );
+                logical_replay_conn = Some(conn);
             }
             (Some(_), Some(_)) => {
                 return Err(Error::DatabaseSyncEngineError(
@@ -1045,25 +1056,36 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         }
 
-        main_session.commit(0)?;
-        // now DB is equivalent to the some remote state (all local changes reverted, all remote changes applied)
-        // remember this frame watermark as a checkpoint for revert for pull operations in future
-        let revert_since_wal_watermark = main_session.frames_count()?;
+        let phase_conn = logical_replay_conn.as_ref().unwrap_or(&main_conn);
+        let revert_since_wal_watermark = if logical_replay_conn.is_none() {
+            main_session.commit(0)?;
+            // now DB is equivalent to the some remote state (all local changes reverted, all remote changes applied)
+            // remember this frame watermark as a checkpoint for revert for pull operations in future
+            main_session.frames_count()?
+        } else {
+            0
+        };
 
-        // Phase 3: DB now has sane WAL - but schema cookie can be arbitrary - so we need to bump it (potentially forcing re-prepare for cached statement)
-        let current_schema_version = main_conn.read_schema_version()?;
-        let final_schema_version = current_schema_version.max(main_conn_schema_version) + 1;
-        main_conn.write_schema_version(final_schema_version)?;
-        tracing::info!(
-            "apply_changes(path={}): updated schema version to {}",
-            self.main_db_path,
-            final_schema_version
-        );
+        // Phase 3: for raw WAL replay, the schema cookie can be arbitrary after
+        // rollback/apply, so bump it to force a clean reprepare boundary. For
+        // logical MVCC replay we already executed schema/header statements
+        // directly, and an extra bump inside the same WAL session can itself
+        // trigger SchemaUpdated on subsequent statements.
+        if logical_replay_conn.is_none() {
+            let current_schema_version = main_conn.read_schema_version()?;
+            let final_schema_version = current_schema_version.max(main_conn_schema_version) + 1;
+            main_conn.write_schema_version(final_schema_version)?;
+            tracing::info!(
+                "apply_changes(path={}): updated schema version to {}",
+                self.main_db_path,
+                final_schema_version
+            );
+        }
 
         // Phase 4: as now DB has all data from remote - let's read pull generation and last change id for current client
         // we will use last_change_id in order to replay local changes made strictly after that id locally
         let (remote_pull_gen, remote_last_change_id) =
-            read_last_change_id(coro, &main_conn, &self.client_unique_id).await?;
+            read_last_change_id(coro, phase_conn, &self.client_unique_id).await?;
 
         // we update pull generation and last_change_id at remote on push, but locally its updated on pull
         // so its impossible to have remote pull generation to be greater than local one
@@ -1078,7 +1100,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // if remove_pull_gen < local_pull_gen - this means that remote portion of WAL have no overlaps with all our local changes and we need to replay all of them
             Some(0)
         };
-
         // Phase 5: collect local changes
         // note, that collecting chanages from main_conn will yield zero rows as we already rolled back everything from it
         // but since we didn't commited these changes yet - we can just collect changes from another connection
@@ -1107,7 +1128,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path,
             local_changes.len()
         );
-
         // Phase 6: replay local changes
         // we can skip this phase if we are sure that we had no local changes before
         if !local_changes.is_empty() || local_rollback != 0 || remote_rollback != 0 || had_cdc_table
@@ -1115,7 +1135,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // first, we update last_change id in the local meta table for sync
             update_last_change_id(
                 coro,
-                &main_conn,
+                phase_conn,
                 &self.client_unique_id,
                 local_pull_gen + 1,
                 0,
@@ -1128,17 +1148,20 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "apply_changes(path={}): initiate CDC pragma again in order to recreate CDC table",
                     self.main_db_path,
                 );
-                let _ = main_conn.pragma_update(CDC_PRAGMA_NAME, "'full'")?;
+                if logical_replay_conn.is_none() {
+                    phase_conn.reset_main_mvcc_tx_for_wal_session();
+                }
+                let _ = phase_conn.pragma_update(CDC_PRAGMA_NAME, "'full'")?;
             }
 
             let mut replay = DatabaseReplaySession {
-                conn: main_conn.clone(),
+                conn: phase_conn.clone(),
                 cached_delete_stmt: HashMap::new(),
                 cached_insert_stmt: HashMap::new(),
                 cached_update_stmt: HashMap::new(),
                 in_txn: true,
                 generator: DatabaseReplayGenerator {
-                    conn: main_conn.clone(),
+                    conn: phase_conn.clone(),
                     opts: DatabaseReplaySessionOpts {
                         use_implicit_rowid: false,
                     },
@@ -1179,6 +1202,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
 
         // Final: now we did all necessary operations as one big transaction and we are ready to commit
+        if let Some(logical_conn) = logical_replay_conn {
+            logical_conn.execute("COMMIT")?;
+            logical_conn.publish_schema_if_newer();
+            return Ok(logical_conn.wal_state()?.max_frame);
+        }
         main_conn.end_nested();
         main_session.wal_session.end(true)?;
         main_conn.publish_schema_if_newer();
