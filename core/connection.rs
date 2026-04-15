@@ -1314,9 +1314,66 @@ impl Connection {
         Ok(())
     }
 
+    /// Discard the current main-database MVCC transaction while keeping the
+    /// surrounding WAL-insert session open.
+    ///
+    /// Sync replay uses SQL statements inside a raw WAL session to inspect
+    /// metadata before applying remote changes. Those reads can leave a
+    /// non-exclusive MVCC transaction attached to the connection, which later
+    /// prevents schema/header replay from upgrading to the exclusive MVCC
+    /// transaction required for DDL.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn reset_main_mvcc_tx_for_wal_session(&self) {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return;
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return;
+        };
+        let pager = self.pager.load();
+        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+    }
+
+    /// Returns whether the main database currently has a live MVCC transaction.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn has_main_mvcc_tx_for_wal_session(&self) -> bool {
+        self.get_mv_tx_id().is_some()
+    }
+
+    /// Commit the main-database MVCC transaction while keeping the surrounding
+    /// raw WAL-insert session open.
+    ///
+    /// Sync replay uses a WAL session to rewrite rollback frames, then runs
+    /// logical MVCC SQL on the same connection. Those SQL statements open a
+    /// normal MVCC transaction that `wal_insert_end()` does not commit for us.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn commit_main_mvcc_tx_for_wal_session(self: &Arc<Self>) -> Result<()> {
+        use crate::types::IOResult;
+
+        let mv_store_handle = self.mv_store();
+        let Some(mv_store) = mv_store_handle.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+
+        let mut state_machine = mv_store.commit_tx(tx_id, self)?;
+        loop {
+            match state_machine.step(mv_store)? {
+                IOResult::IO(io) => io.wait(self.db.io.as_ref())?,
+                IOResult::Done(_) => break,
+            }
+        }
+        assert!(state_machine.is_finalized());
+        self.set_mv_tx(None);
+        self.publish_schema_if_newer();
+        Ok(())
+    }
+
     /// Publish the connection's current schema snapshot to the shared database
     /// cache after a successful commit so other live connections can refresh.
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn publish_schema_if_newer(&self) {
         let schema = self.schema.read().clone();
         self.db.update_schema_if_newer(schema);
@@ -3342,6 +3399,11 @@ mod tests {
         db.connect().unwrap()
     }
 
+    fn open_database(path: &std::path::Path) -> Arc<Database> {
+        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+        Database::open_file(io, path.to_str().unwrap()).unwrap()
+    }
+
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
         open_connection_with_opts(path, DatabaseOpts::new())
     }
@@ -3532,6 +3594,159 @@ mod tests {
         let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
 
         assert_eq!(pager_shared_ptr, db_shared_ptr);
+    }
+
+    #[test]
+    fn test_main_schema_is_published_to_fresh_sibling_connections_after_mvcc_ddl() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let db = open_database(&db_path);
+        let conn1 = db.connect().unwrap();
+
+        conn1.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        conn1.execute("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+
+        let conn2 = db.connect().unwrap();
+        let mut stmt = conn2
+            .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+            .unwrap();
+        let sql = match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<&str>(0).unwrap().to_string(),
+            other => panic!("expected schema row, got {other:?}"),
+        };
+        assert!(
+            sql.contains("note"),
+            "fresh sibling connection should see published schema, got: {sql}"
+        );
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn test_reset_main_mvcc_tx_for_wal_session_allows_schema_replay() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+
+        let conn_fail = open_connection(&db_path);
+        conn_fail.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn_fail
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+
+        conn_fail.wal_insert_begin().unwrap();
+        conn_fail.start_nested();
+        assert_eq!(
+            query_single_i64(
+                &conn_fail,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 't'"
+            ),
+            1
+        );
+        let err = conn_fail
+            .execute("ALTER TABLE t ADD COLUMN note TEXT")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exclusive transaction"),
+            "expected exclusive-transaction error, got: {err}"
+        );
+        conn_fail.end_nested();
+        conn_fail.wal_insert_end(false).unwrap();
+
+        let conn_ok = open_connection(&db_path);
+        conn_ok.wal_insert_begin().unwrap();
+        conn_ok.start_nested();
+        assert_eq!(
+            query_single_i64(
+                &conn_ok,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 't'"
+            ),
+            1
+        );
+        conn_ok.reset_main_mvcc_tx_for_wal_session();
+        conn_ok
+            .execute("ALTER TABLE t ADD COLUMN note TEXT")
+            .unwrap();
+        let columns = query_single_i64(
+            &conn_ok,
+            "SELECT COUNT(*) FROM pragma_table_info('t') WHERE name = 'note'",
+        );
+        assert_eq!(columns, 1);
+        conn_ok.end_nested();
+        conn_ok.wal_insert_end(false).unwrap();
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn test_wal_session_schema_version_bump_after_mvcc_ddl_can_trigger_schema_updated() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+
+        conn.wal_insert_begin().unwrap();
+        conn.start_nested();
+        assert_eq!(
+            query_single_i64(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 't'"
+            ),
+            1
+        );
+        conn.reset_main_mvcc_tx_for_wal_session();
+        conn.execute("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+
+        let current = conn.read_schema_version().unwrap();
+        let err = conn
+            .write_schema_version(current + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("schema changed"),
+            "expected schema changed error, got: {err}"
+        );
+
+        conn.end_nested();
+        conn.wal_insert_end(false).unwrap();
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[test]
+    fn test_wal_session_commit_helper_persists_mvcc_schema_replay() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+
+        let conn = open_connection(&db_path);
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+
+        conn.wal_insert_begin().unwrap();
+        conn.start_nested();
+        conn.reset_main_mvcc_tx_for_wal_session();
+        conn.execute("ALTER TABLE t ADD COLUMN note TEXT").unwrap();
+        conn.execute("INSERT INTO t(id, payload, note) VALUES (1, 'alpha', 'beta')")
+            .unwrap();
+        assert!(conn.has_main_mvcc_tx_for_wal_session());
+        conn.commit_main_mvcc_tx_for_wal_session().unwrap();
+        assert!(!conn.has_main_mvcc_tx_for_wal_session());
+        conn.end_nested();
+        conn.wal_insert_end(true).unwrap();
+
+        let verify = open_connection(&db_path);
+        assert_eq!(
+            query_single_i64(
+                &verify,
+                "SELECT COUNT(*) FROM pragma_table_info('t') WHERE name = 'note'"
+            ),
+            1
+        );
+        assert_eq!(query_single_i64(&verify, "SELECT COUNT(*) FROM t"), 1);
     }
 
     #[test]
