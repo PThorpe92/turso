@@ -336,7 +336,7 @@ impl SyncEngine {
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
             remote_encryption_key: self.opts.remote_encryption_key.clone(),
-            logical_mvcc_pull: false,
+            logical_mvcc_pull: true,
         };
 
         let io = self.io()?;

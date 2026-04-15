@@ -1317,6 +1317,110 @@ mod tests {
     }
 
     #[test]
+    pub fn test_database_tape_replay_schema_changes_mvcc() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                let source_conn = db1.connect(&coro).await.unwrap();
+                source_conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+                source_conn
+                    .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+                    .unwrap();
+                source_conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+                source_conn.execute("ALTER TABLE t ADD COLUMN z").unwrap();
+                source_conn
+                    .execute("INSERT INTO t VALUES (2, 20, 30)")
+                    .unwrap();
+
+                let target_setup_conn = db2.connect(&coro).await.unwrap();
+                target_setup_conn
+                    .pragma_update("journal_mode", "'mvcc'")
+                    .unwrap();
+                drop(target_setup_conn);
+
+                let replay_opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: false,
+                };
+                let mut session = db2.start_replay_session(&coro, replay_opts).await.unwrap();
+                let iter_opts = DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(iter_opts).unwrap();
+                while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                    session.replay(&coro, operation).await.unwrap();
+                }
+                drop(session);
+
+                let target_conn = db2.connect(&coro).await.unwrap();
+                let mut schema_stmt = target_conn
+                    .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+                    .unwrap();
+                let schema_row = run_stmt_once(&coro, &mut schema_stmt)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let schema = schema_row.get_values().next().unwrap().clone();
+
+                let mut rows_stmt = target_conn
+                    .prepare("SELECT x, y, z FROM t ORDER BY x")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut rows_stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+
+                crate::Result::Ok((schema, rows))
+            }
+        });
+
+        let (schema, rows) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        };
+
+        assert_eq!(
+            schema,
+            turso_core::Value::Text(turso_core::types::Text::new(
+                "CREATE TABLE t (x INTEGER PRIMARY KEY, y, z)"
+            ))
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    turso_core::Value::from_i64(1),
+                    turso_core::Value::from_i64(10),
+                    turso_core::Value::Null,
+                ],
+                vec![
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_i64(20),
+                    turso_core::Value::from_i64(30),
+                ],
+            ]
+        );
+    }
+
+    #[test]
     pub fn test_database_tape_replay_alter_table() {
         let temp_file1 = NamedTempFile::new().unwrap();
         let db_path1 = temp_file1.path().to_str().unwrap();

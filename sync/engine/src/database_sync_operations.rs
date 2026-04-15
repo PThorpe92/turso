@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -633,13 +634,9 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                     )));
                 }
                 buffer.as_mut_slice()[WAL_FRAME_HEADER..].copy_from_slice(&page);
-                page_data_opt = wait_proto_message(
-                    ctx.coro,
-                    &completion,
-                    &ctx.io.network_stats,
-                    &mut bytes,
-                )
-                .await?;
+                page_data_opt =
+                    wait_proto_message(ctx.coro, &completion, &ctx.io.network_stats, &mut bytes)
+                        .await?;
                 let mut frame_info = WalFrameInfo {
                     db_size: 0,
                     page_no: page_id as u32 + 1,
@@ -1511,6 +1508,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
+    logical_updates: bool,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
@@ -1522,7 +1520,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             bootstrap_db_file_legacy(ctx, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync).await
+            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, logical_updates).await
         }
     }
 }
@@ -1532,6 +1530,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     partial_sync: Option<PartialSyncOpts>,
+    logical_updates: bool,
 ) -> Result<DatabasePullRevision> {
     if let Some(PartialSyncOpts {
         bootstrap_strategy: None,
@@ -1569,7 +1568,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
 
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
-        logical_updates: false,
+        logical_updates,
         server_revision: String::new(),
         client_revision: String::new(),
         long_poll_timeout_ms: 0,
@@ -1606,53 +1605,86 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
         main_db_path,
         header
     );
-    ensure_page_stream(&header, "bootstrap_db_file")?;
-    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
-    let c = Completion::new_trunc(move |result| {
-        let Ok(rc) = result else {
-            return;
-        };
-        assert!(rc as usize == 0);
-    });
-    let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-    while !c.succeeded() {
-        ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-    }
+    match pull_updates_stream_kind(&header)? {
+        PullUpdatesStreamKind::Pages => {
+            let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
+            let c = Completion::new_trunc(move |result| {
+                let Ok(rc) = result else {
+                    return;
+                };
+                assert!(rc as usize == 0);
+            });
+            let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
+            while !c.succeeded() {
+                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+            }
 
-    #[allow(clippy::arc_with_non_send_sync)]
-    let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
-    while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
-        ctx.coro,
-        &completion,
-        &ctx.io.network_stats,
-        &mut bytes,
-    )
-    .await?
-    {
-        tracing::debug!(
-            "bootstrap_db_file: received page page_id={}",
-            page_data.page_id
-        );
-        let offset = page_data.page_id * PAGE_SIZE as u64;
-        let page = decode_page(&header, page_data)?;
-        if page.len() != PAGE_SIZE {
-            return Err(Error::DatabaseSyncEngineError(format!(
-                "page has unexpected size: {} != {}",
-                page.len(),
-                PAGE_SIZE
-            )));
+            #[allow(clippy::arc_with_non_send_sync)]
+            let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+            while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
+                ctx.coro,
+                &completion,
+                &ctx.io.network_stats,
+                &mut bytes,
+            )
+            .await?
+            {
+                tracing::debug!(
+                    "bootstrap_db_file: received page page_id={}",
+                    page_data.page_id
+                );
+                let offset = page_data.page_id * PAGE_SIZE as u64;
+                let page = decode_page(&header, page_data)?;
+                if page.len() != PAGE_SIZE {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "page has unexpected size: {} != {}",
+                        page.len(),
+                        PAGE_SIZE
+                    )));
+                }
+                buffer.as_mut_slice().copy_from_slice(&page);
+                let c = Completion::new_write(move |result| {
+                    // todo(sivukhin): we need to error out in case of partial read
+                    let Ok(size) = result else {
+                        return;
+                    };
+                    assert!(size as usize == PAGE_SIZE);
+                });
+                let c = file.pwrite(offset, buffer.clone(), c)?;
+                while !c.succeeded() {
+                    ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+                }
+            }
         }
-        buffer.as_mut_slice().copy_from_slice(&page);
-        let c = Completion::new_write(move |result| {
-            // todo(sivukhin): we need to error out in case of partial read
-            let Ok(size) = result else {
-                return;
+        PullUpdatesStreamKind::Logical => {
+            let mut txns = Vec::new();
+            while let Some(txn) = wait_proto_message::<Ctx, LogicalTxnData>(
+                ctx.coro,
+                &completion,
+                &ctx.io.network_stats,
+                &mut bytes,
+            )
+            .await?
+            {
+                txns.push(txn);
+            }
+
+            let db = turso_core::Database::open_file(io.clone(), main_db_path)?;
+            let conn = db.connect()?;
+            let mut replay = DatabaseReplaySession {
+                conn: conn.clone(),
+                cached_delete_stmt: HashMap::new(),
+                cached_insert_stmt: HashMap::new(),
+                cached_update_stmt: HashMap::new(),
+                in_txn: false,
+                generator: DatabaseReplayGenerator {
+                    conn,
+                    opts: DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                },
             };
-            assert!(size as usize == PAGE_SIZE);
-        });
-        let c = file.pwrite(offset, buffer.clone(), c)?;
-        while !c.succeeded() {
-            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+            apply_logical_transactions(ctx.coro, &mut replay, &txns).await?;
         }
     }
     Ok(DatabasePullRevision::V1 {
@@ -2013,7 +2045,10 @@ pub async fn wait_all_results<Ctx, T: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, sync::Arc};
+    use std::{
+        cell::RefCell,
+        sync::{Arc, Mutex},
+    };
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;
@@ -2021,17 +2056,19 @@ mod tests {
 
     use crate::{
         database_sync_engine::DataStats,
-        database_sync_engine_io::{DataCompletion, DataPollResult},
+        database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
-            apply_logical_transactions, logical_txn_to_tape_operations, wait_proto_message,
+            apply_logical_transactions, bootstrap_db_file_v1, logical_txn_to_tape_operations,
+            pull_updates_v1, wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats,
+            SyncOperationCtx,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
         server_proto::{
-            LogicalOp, LogicalOpType, LogicalTxnData, PageData, PullUpdatesRespProtoBody,
-            PullUpdatesStreamKind,
+            LogicalOp, LogicalOpType, LogicalTxnData, PageData, PullUpdatesReqProtoBody,
+            PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
-        types::Coro,
+        types::{Coro, DatabasePullRevision, DatabaseRowMutation, DatabaseRowTransformResult},
         Result,
     };
 
@@ -2070,6 +2107,82 @@ mod tests {
         fn is_done(&self) -> crate::Result<bool> {
             Ok(self.data.borrow().is_empty())
         }
+    }
+
+    struct TestTransformPollResult(Vec<DatabaseRowTransformResult>);
+
+    impl DataPollResult<DatabaseRowTransformResult> for TestTransformPollResult {
+        fn data(&self) -> &[DatabaseRowTransformResult] {
+            &self.0
+        }
+    }
+
+    struct TestTransformCompletion;
+
+    impl DataCompletion<DatabaseRowTransformResult> for TestTransformCompletion {
+        type DataPollResult = TestTransformPollResult;
+
+        fn status(&self) -> crate::Result<Option<u16>> {
+            Ok(Some(200))
+        }
+
+        fn poll_data(&self) -> crate::Result<Option<Self::DataPollResult>> {
+            Ok(None)
+        }
+
+        fn is_done(&self) -> crate::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct TestHttpIo {
+        response: Vec<u8>,
+        chunk: usize,
+        request: Mutex<Option<(String, String, Vec<u8>)>>,
+    }
+
+    impl SyncEngineIo for TestHttpIo {
+        type DataCompletionBytes = TestCompletion;
+        type DataCompletionTransform = TestTransformCompletion;
+
+        fn full_read(&self, _path: &str) -> Result<Self::DataCompletionBytes> {
+            panic!("full_read is not used in this test")
+        }
+
+        fn full_write(&self, _path: &str, _content: Vec<u8>) -> Result<Self::DataCompletionBytes> {
+            panic!("full_write is not used in this test")
+        }
+
+        fn transform(
+            &self,
+            _mutations: Vec<DatabaseRowMutation>,
+        ) -> Result<Self::DataCompletionTransform> {
+            panic!("transform is not used in this test")
+        }
+
+        fn http(
+            &self,
+            _url: Option<&str>,
+            method: &str,
+            path: &str,
+            body: Option<Vec<u8>>,
+            _headers: &[(&str, &str)],
+        ) -> Result<Self::DataCompletionBytes> {
+            self.request.lock().unwrap().replace((
+                method.to_string(),
+                path.to_string(),
+                body.unwrap_or_default(),
+            ));
+            Ok(TestCompletion {
+                data: RefCell::new(self.response.clone().into()),
+                chunk: self.chunk,
+            })
+        }
+
+        fn add_io_callback(&self, _callback: Box<dyn FnMut() -> bool + Send>) {}
+
+        fn step_io_callbacks(&self) {}
     }
 
     #[test]
@@ -2146,6 +2259,236 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.stream_kind, PullUpdatesStreamKind::Logical as i32);
+    }
+
+    #[test]
+    fn pull_updates_v1_decodes_logical_stream_and_sets_request_flag() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o44".to_string(),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Logical as i32,
+        };
+        let txn = LogicalTxnData {
+            end_offset: 44,
+            commit_ts: 77,
+            ops: vec![LogicalOp {
+                op_type: LogicalOpType::SchemaDdl as i32,
+                table_name: String::new(),
+                rowid: 0,
+                record: Bytes::new(),
+                sql: "CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)".to_string(),
+                user_version: None,
+                application_id: None,
+            }],
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&txn.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 5,
+            request: Mutex::new(None),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path, turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o44");
+                assert_eq!(file.size().unwrap(), 0);
+                match result {
+                    PullUpdatesV1Result::Logical(txns) => assert_eq!(txns, vec![txn]),
+                    PullUpdatesV1Result::Pages => panic!("expected logical stream"),
+                }
+                let (method, path, body) = io.request.lock().unwrap().clone().unwrap();
+                assert_eq!(method, "POST");
+                assert_eq!(path, "/pull-updates");
+                let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
+                assert!(request.logical_updates);
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn pull_updates_v1_accepts_page_stream_when_logical_pull_is_requested() {
+        let page = vec![7u8; super::PAGE_SIZE];
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o45".to_string(),
+            db_size: 1,
+            raw_encoding: Some(crate::server_proto::PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+        };
+        let page_data = PageData {
+            page_id: 0,
+            encoded_page: page.clone().into(),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 11,
+            request: Mutex::new(None),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path, turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o45");
+                match result {
+                    PullUpdatesV1Result::Pages => {}
+                    PullUpdatesV1Result::Logical(_) => panic!("expected page stream"),
+                }
+                let bytes = std::fs::read(path).unwrap();
+                assert_eq!(bytes.len(), super::WAL_FRAME_SIZE);
+                let info = turso_core::types::WalFrameInfo::from_frame_header(
+                    &bytes[..super::WAL_FRAME_HEADER],
+                );
+                assert_eq!(info.page_no, 1);
+                assert_eq!(info.db_size, 1);
+                assert_eq!(&bytes[super::WAL_FRAME_HEADER..], page.as_slice());
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_db_file_v1_replays_logical_stream() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o44".to_string(),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Logical as i32,
+        };
+        let txn = LogicalTxnData {
+            end_offset: 44,
+            commit_ts: 77,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)".to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&txn.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 5,
+            request: Mutex::new(None),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap().to_string();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let path = path.clone();
+            let core_io = core_io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let revision = bootstrap_db_file_v1(&ctx, &core_io, &path, None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o44");
+
+                let db = turso_core::Database::open_file(core_io.clone(), &path).unwrap();
+                let conn = db.connect().unwrap();
+                let mut stmt = conn.prepare("SELECT x, y FROM t ORDER BY x").unwrap();
+                let row = run_stmt_once(&coro, &mut stmt).await?.unwrap();
+                assert_eq!(row.get::<i64>(0).unwrap(), 1);
+                assert_eq!(row.get::<&str>(1).unwrap(), "alpha");
+                assert!(run_stmt_once(&coro, &mut stmt).await?.is_none());
+
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
     }
 
     #[test]

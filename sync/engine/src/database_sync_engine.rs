@@ -13,12 +13,12 @@ use crate::{
     database_sync_engine_io::SyncEngineIo,
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
-        acquire_slot, apply_transformation, bootstrap_db_file, connect_untracked,
-        count_local_changes, has_table, push_logical_changes, read_last_change_id, read_wal_salt,
-        reset_wal_file, update_last_change_id, wait_all_results,
-        wal_apply_from_file, wal_pull_to_file, apply_logical_transactions_without_commit,
-        pull_updates_v1, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
-        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        acquire_slot, apply_logical_transactions_without_commit, apply_transformation,
+        bootstrap_db_file, connect_untracked, count_local_changes, has_table, pull_updates_v1,
+        push_logical_changes, read_last_change_id, read_wal_salt, reset_wal_file,
+        update_last_change_id, wait_all_results, wal_apply_from_file, wal_pull_to_file,
+        PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
+        WAL_FRAME_SIZE,
     },
     database_tape::{
         DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
@@ -260,6 +260,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     main_db_path,
                     opts.protocol_version_hint,
                     partial_sync_opts,
+                    opts.logical_mvcc_pull && opts.remote_encryption_key.is_none() && !partial,
                 )
                 .await?;
                 let meta = DatabaseMetadata {
@@ -779,8 +780,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
+        let use_logical_mvcc_pull =
+            self.opts.logical_mvcc_pull && self.opts.remote_encryption_key.is_none();
         let mut logical_txns = None;
-        let next_revision = if self.opts.logical_mvcc_pull {
+        if self.opts.logical_mvcc_pull && !use_logical_mvcc_pull {
+            tracing::info!(
+                "wait_changes(path={}): disable logical MVCC pull because remote encryption is configured",
+                self.main_db_path
+            );
+        }
+        let next_revision = if use_logical_mvcc_pull {
             match &revision {
                 Some(DatabasePullRevision::V1 { revision }) => {
                     match pull_updates_v1(
@@ -799,21 +808,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         }
                     }
                 }
-                None => match pull_updates_v1(
-                    ctx,
-                    &file.value,
-                    "",
-                    self.opts.long_poll_timeout,
-                    true,
-                )
-                .await?
-                {
-                    (next_revision, PullUpdatesV1Result::Pages) => next_revision,
-                    (next_revision, PullUpdatesV1Result::Logical(txns)) => {
-                        logical_txns = Some(txns);
-                        next_revision
+                None => {
+                    match pull_updates_v1(ctx, &file.value, "", self.opts.long_poll_timeout, true)
+                        .await?
+                    {
+                        (next_revision, PullUpdatesV1Result::Pages) => next_revision,
+                        (next_revision, PullUpdatesV1Result::Logical(txns)) => {
+                            logical_txns = Some(txns);
+                            next_revision
+                        }
                     }
-                },
+                }
                 Some(DatabasePullRevision::Legacy { .. }) => {
                     wal_pull_to_file(
                         ctx,
@@ -1020,8 +1025,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         },
                     },
                 };
-                apply_logical_transactions_without_commit(coro, &mut replay, logical_txns)
-                    .await?;
+                apply_logical_transactions_without_commit(coro, &mut replay, logical_txns).await?;
                 tracing::info!(
                     "apply_changes(path={}): applied {} logical transactions from remote",
                     self.main_db_path,
@@ -1177,6 +1181,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // Final: now we did all necessary operations as one big transaction and we are ready to commit
         main_conn.end_nested();
         main_session.wal_session.end(true)?;
+        main_conn.publish_schema_if_newer();
 
         Ok(revert_since_wal_watermark)
     }

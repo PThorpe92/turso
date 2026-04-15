@@ -224,7 +224,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
-            logical_mvcc_pull: false,
+            logical_mvcc_pull: true,
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {

@@ -1756,3 +1756,184 @@ fn test_cdc_drop_turso_cdc_version(db: TempDatabase) {
     );
     assert_eq!(rows, vec![vec![Value::Integer(0)]]);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_mvcc_full_captures_dml(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+    conn.execute("UPDATE t SET y = 11 WHERE x = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE x = 2").unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(
+        &conn,
+        "SELECT * FROM turso_cdc ORDER BY change_id",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Integer(10)])),
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                2,
+                None,
+                Some(record([Value::Integer(2), Value::Integer(20)])),
+                None,
+            ),
+            v2_commit(),
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Integer(10)])),
+                Some(record([Value::Integer(1), Value::Integer(11)])),
+                Some(record([
+                    Value::Integer(0),
+                    Value::Integer(1),
+                    Value::Null,
+                    Value::Integer(11),
+                ])),
+            ),
+            v2_commit(),
+            v2_row(
+                -1,
+                "t",
+                2,
+                Some(record([Value::Integer(2), Value::Integer(20)])),
+                None,
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_mvcc_full_captures_ddl(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN y").unwrap();
+    conn.execute("CREATE INDEX t_idx ON t(y)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("sqlite_schema".to_string())],
+            vec![Value::Integer(2), Value::Null],
+            vec![Value::Integer(0), Value::Text("sqlite_schema".to_string())],
+            vec![Value::Integer(2), Value::Null],
+            vec![Value::Integer(1), Value::Text("sqlite_schema".to_string())],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_can_switch_to_mvcc_while_active(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(
+        &conn,
+        "SELECT * FROM turso_cdc ORDER BY change_id",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Integer(10)])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_mvcc_reopen_preserves_existing_log_and_reenables(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    drop(conn);
+
+    let reopened = TempDatabase::builder().with_db_path(&db.path).build();
+    let reopened_conn = reopened.connect_limbo();
+
+    let existing_rows = limbo_exec_rows(&reopened_conn, "SELECT COUNT(*) FROM turso_cdc");
+    assert_eq!(existing_rows, vec![vec![Value::Integer(2)]]);
+
+    let pragma_rows = limbo_exec_rows(&reopened_conn, "PRAGMA capture_data_changes_conn");
+    assert_eq!(
+        pragma_rows,
+        vec![vec![
+            Value::Text("off".to_string()),
+            Value::Null,
+            Value::Null
+        ]]
+    );
+
+    reopened_conn
+        .execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    reopened_conn
+        .execute("INSERT INTO t VALUES (2, 20)")
+        .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(
+        &reopened_conn,
+        "SELECT * FROM turso_cdc ORDER BY change_id",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Integer(10)])),
+                None,
+            ),
+            v2_commit(),
+            v2_row(
+                1,
+                "t",
+                2,
+                None,
+                Some(record([Value::Integer(2), Value::Integer(20)])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
