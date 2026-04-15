@@ -1,0 +1,19 @@
+[package]
+name = "turso-local-examples"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+turso = { path = "../", features = ["sync"] }
+
+[[bin]]
+name = "sync"
+path = "src/bin/sync.rs"
+
+[workspace]

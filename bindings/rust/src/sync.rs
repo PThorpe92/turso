@@ -1655,6 +1655,87 @@ mod tests {
         assert_eq!(rows[1][2], Value::Text("from-remote".to_string()));
     }
 
+    #[tokio::test]
+    pub async fn test_sync_pull_remote_mvcc_schema_change_visible_on_live_connection() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        let mode = server.db_sql("PRAGMA journal_mode = 'mvcc'").await.unwrap();
+        assert_eq!(mode, vec![vec![Value::Text("mvcc".to_string())]]);
+
+        server
+            .db_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES (1, 'alpha')")
+            .await
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let mode = all_rows(
+            conn.query("PRAGMA journal_mode = 'mvcc'", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mode, vec![vec![Value::Text("mvcc".to_string())]]);
+
+        let rows = all_rows(
+            conn.query("SELECT id, payload FROM t ORDER BY id", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::Integer(1), Value::Text("alpha".to_string())]]
+        );
+
+        server
+            .db_sql("ALTER TABLE t ADD COLUMN note TEXT")
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t (id, payload, note) VALUES (2, 'beta', 'from-remote')")
+            .await
+            .unwrap();
+
+        db.pull().await.unwrap();
+
+        let rows = all_rows(
+            conn.query("SELECT id, payload, note FROM t ORDER BY id", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Text("alpha".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Integer(2),
+                    Value::Text("beta".to_string()),
+                    Value::Text("from-remote".to_string()),
+                ],
+            ]
+        );
+    }
+
     /// Push test: local adds a column that remote already has.
     /// The push must succeed (ALTER TABLE ADD COLUMN error is ignored in the batch).
     #[tokio::test]
