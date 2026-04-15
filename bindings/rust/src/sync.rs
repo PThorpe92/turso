@@ -1736,6 +1736,117 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    pub async fn test_sync_pull_remote_mvcc_schema_change_backfills_existing_rows() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+
+        let mode = server.db_sql("PRAGMA journal_mode = 'mvcc'").await.unwrap();
+        assert_eq!(mode, vec![vec![Value::Text("mvcc".to_string())]]);
+
+        server
+            .db_sql(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)",
+            )
+            .await
+            .unwrap();
+        server
+            .db_sql(
+                "INSERT INTO t (id, owner, payload, rev) VALUES (1, 'seed-a', 'alpha', 1), (2, 'seed-b', 'beta', 1)",
+            )
+            .await
+            .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+
+        let rows = all_rows(
+            conn.query("SELECT id, owner, payload, rev FROM t ORDER BY id", ())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Text("seed-a".to_string()),
+                    Value::Text("alpha".to_string()),
+                    Value::Integer(1),
+                ],
+                vec![
+                    Value::Integer(2),
+                    Value::Text("seed-b".to_string()),
+                    Value::Text("beta".to_string()),
+                    Value::Integer(1),
+                ],
+            ]
+        );
+
+        server
+            .db_sql("ALTER TABLE t ADD COLUMN note TEXT")
+            .await
+            .unwrap();
+        server
+            .db_sql(
+                "UPDATE t SET payload = 'alpha-remote', rev = 2, note = 'backfilled' WHERE id = 1",
+            )
+            .await
+            .unwrap();
+        server
+            .db_sql(
+                "INSERT INTO t (id, owner, payload, rev, note) VALUES (3, 'seed-c', 'gamma', 1, 'new-row')",
+            )
+            .await
+            .unwrap();
+
+        db.pull().await.unwrap();
+
+        let rows = all_rows(
+            conn.query(
+                "SELECT id, owner, payload, rev, note FROM t ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Text("seed-a".to_string()),
+                    Value::Text("alpha-remote".to_string()),
+                    Value::Integer(2),
+                    Value::Text("backfilled".to_string()),
+                ],
+                vec![
+                    Value::Integer(2),
+                    Value::Text("seed-b".to_string()),
+                    Value::Text("beta".to_string()),
+                    Value::Integer(1),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Integer(3),
+                    Value::Text("seed-c".to_string()),
+                    Value::Text("gamma".to_string()),
+                    Value::Integer(1),
+                    Value::Text("new-row".to_string()),
+                ],
+            ]
+        );
+    }
+
     /// Push test: local adds a column that remote already has.
     /// The push must succeed (ALTER TABLE ADD COLUMN error is ignored in the batch).
     #[tokio::test]
