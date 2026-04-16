@@ -2251,6 +2251,7 @@ mod tests {
         response: Vec<u8>,
         chunk: usize,
         request: Mutex<Option<(String, String, Vec<u8>)>>,
+        headers: Mutex<Vec<(String, String)>>,
     }
 
     impl SyncEngineIo for TestHttpIo {
@@ -2278,13 +2279,17 @@ mod tests {
             method: &str,
             path: &str,
             body: Option<Vec<u8>>,
-            _headers: &[(&str, &str)],
+            headers: &[(&str, &str)],
         ) -> Result<Self::DataCompletionBytes> {
             self.request.lock().unwrap().replace((
                 method.to_string(),
                 path.to_string(),
                 body.unwrap_or_default(),
             ));
+            *self.headers.lock().unwrap() = headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
             Ok(TestCompletion {
                 data: RefCell::new(self.response.clone().into()),
                 chunk: self.chunk,
@@ -2453,6 +2458,7 @@ mod tests {
             response,
             chunk: 5,
             request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
         });
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_str().unwrap();
@@ -2521,6 +2527,7 @@ mod tests {
             response,
             chunk: 11,
             request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
         });
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_str().unwrap();
@@ -2558,6 +2565,65 @@ mod tests {
                 assert_eq!(info.page_no, 1);
                 assert_eq!(info.db_size, 1);
                 assert_eq!(&bytes[super::WAL_FRAME_HEADER..], page.as_slice());
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn pull_updates_v1_sends_encryption_header_for_logical_pull() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o44".to_string(),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Logical as i32,
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 32,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path, turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    Some("dGVzdC1lbmNyeXB0aW9uLWtleQ=="),
+                );
+                let (_revision, result) =
+                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                match result {
+                    PullUpdatesV1Result::Logical(txns) => assert!(txns.is_empty()),
+                    PullUpdatesV1Result::Pages => panic!("expected logical stream"),
+                }
+
+                let headers = io.headers.lock().unwrap().clone();
+                assert!(headers.iter().any(|(name, value)| {
+                    name == super::ENCRYPTION_KEY_HEADER && value == "dGVzdC1lbmNyeXB0aW9uLWtleQ=="
+                }));
                 Result::Ok(())
             }
         });
@@ -2633,6 +2699,7 @@ mod tests {
             response,
             chunk: 5,
             request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
         });
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_str().unwrap().to_string();

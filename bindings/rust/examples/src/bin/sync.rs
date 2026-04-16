@@ -14,7 +14,7 @@ use tokio::{
     time::{sleep, Instant},
 };
 use turso::{
-    sync::{Builder, Database},
+    sync::{Builder, Database, RemoteEncryptionCipher},
     Connection, Value,
 };
 
@@ -26,6 +26,8 @@ const ITEM_COLUMNS: &[&str] = &["id", "owner", "payload", "rev", "note", "bucket
 struct Config {
     remote_url: String,
     auth_token: Option<String>,
+    remote_encryption_key: Option<String>,
+    remote_encryption_cipher: Option<RemoteEncryptionCipher>,
 }
 
 #[derive(Clone)]
@@ -54,6 +56,13 @@ async fn main() -> Result<()> {
 
     println!("remote url: {}", config.remote_url);
     println!("auth enabled: {}", config.auth_token.is_some());
+    println!(
+        "remote encryption enabled: {}",
+        config.remote_encryption_key.is_some()
+    );
+    if let Some(cipher) = config.remote_encryption_cipher {
+        println!("remote encryption cipher: {cipher:?}");
+    }
     println!("local dir: {}", dir.path().display());
     println!("table: {table}");
 
@@ -176,9 +185,26 @@ fn load_config() -> Result<Config> {
     let remote_url = env::var("TURSO_REMOTE_URL")
         .or_else(|_| env::var("TURSO_LIVE_SYNC_REMOTE_URL"))
         .context("set TURSO_REMOTE_URL to the libsql/http remote database URL")?;
+    let remote_encryption_key = env::var("TURSO_REMOTE_ENCRYPTION_KEY")
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let remote_encryption_cipher = if remote_encryption_key.is_none() {
+        None
+    } else if let Some(cipher) = env::var("TURSO_REMOTE_ENCRYPTION_CIPHER").ok() {
+        Some(
+            cipher
+                .parse()
+                .map_err(|err: String| anyhow!("invalid TURSO_REMOTE_ENCRYPTION_CIPHER: {err}"))?,
+        )
+    } else {
+        Some(RemoteEncryptionCipher::Aes256Gcm)
+    };
     Ok(Config {
         remote_url,
         auth_token: load_auth_token(),
+        remote_encryption_key,
+        remote_encryption_cipher,
     })
 }
 
@@ -212,6 +238,14 @@ async fn build_sync_db(
         .bootstrap_if_empty(bootstrap_if_empty);
     let builder = if let Some(token) = &config.auth_token {
         builder.with_auth_token(token)
+    } else {
+        builder
+    };
+    let builder = if let (Some(key), Some(cipher)) = (
+        config.remote_encryption_key.as_ref(),
+        config.remote_encryption_cipher,
+    ) {
+        builder.with_remote_encryption(key, cipher)
     } else {
         builder
     };
@@ -768,6 +802,9 @@ async fn query_remote_sql(config: &Config, sql: &str) -> Result<Vec<Vec<Value>>>
     }));
     if let Some(token) = &config.auth_token {
         request = request.bearer_auth(token);
+    }
+    if let Some(key) = &config.remote_encryption_key {
+        request = request.header("x-turso-encryption-key", key);
     }
 
     let response = request

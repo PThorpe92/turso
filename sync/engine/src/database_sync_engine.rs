@@ -126,6 +126,13 @@ fn describe_pull_revision(revision: &Option<DatabasePullRevision>) -> String {
     }
 }
 
+fn should_use_logical_mvcc_pull(
+    logical_mvcc_pull_requested: bool,
+    partial_sync_active: bool,
+) -> bool {
+    logical_mvcc_pull_requested && !partial_sync_active
+}
+
 fn resolve_local_replay_floor_change_id(
     logical_replay_active: bool,
     local_pull_gen: i64,
@@ -297,7 +304,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     main_db_path,
                     opts.protocol_version_hint,
                     partial_sync_opts,
-                    opts.logical_mvcc_pull && opts.remote_encryption_key.is_none() && !partial,
+                    should_use_logical_mvcc_pull(opts.logical_mvcc_pull, partial),
                 )
                 .await?;
                 let meta = DatabaseMetadata {
@@ -844,7 +851,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.opts.remote_encryption_key.as_deref(),
         );
         let use_logical_mvcc_pull =
-            self.opts.logical_mvcc_pull && self.opts.remote_encryption_key.is_none();
+            should_use_logical_mvcc_pull(self.opts.logical_mvcc_pull, false);
         tracing::info!(
             "wait_changes(path={}): remote_url={:?} revision={} client_id={} logical_mvcc_pull_requested={} logical_mvcc_pull_active={} last_pull_unix_time={:?} last_push_unix_time={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={}",
             self.main_db_path,
@@ -859,12 +866,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             last_pushed_change_id_hint
         );
         let mut logical_txns = None;
-        if self.opts.logical_mvcc_pull && !use_logical_mvcc_pull {
-            tracing::info!(
-                "wait_changes(path={}): disable logical MVCC pull because remote encryption is configured",
-                self.main_db_path
-            );
-        }
         let next_revision = if use_logical_mvcc_pull {
             let logical_pull = match &revision {
                 Some(DatabasePullRevision::V1 { revision }) => {
@@ -927,20 +928,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 Ok(next_revision) => next_revision,
                 Err(error) => {
                     tracing::error!(
-                        "wait_changes(path={}): page/WAL pull failed: revision={} remote_url={:?} err={:#}",
+                        "wait_changes(path={}): page/WAL pull failed: revision={} remote_url={saved_remote_url:?} err={error:#}",
                         self.main_db_path,
                         describe_pull_revision(&revision),
-                        saved_remote_url,
-                        error
                     );
                     return Err(error);
                 }
             }
         };
 
-        let file_slot = if logical_txns.is_some() {
-            None
-        } else if file.value.size()? == 0 {
+        let file_slot = if logical_txns.is_some() || file.value.size()? == 0 {
             None
         } else {
             Some(file)
@@ -1137,8 +1134,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     .await
                     .map_err(|error| {
                         Error::DatabaseSyncEngineError(format!(
-                            "failed to apply remote logical transactions: {}",
-                            error
+                            "failed to apply remote logical transactions: {error}",
                         ))
                     })?;
                 tracing::info!(
@@ -1277,8 +1273,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     .pragma_update(CDC_PRAGMA_NAME, "'full'")
                     .map_err(|error| {
                         Error::DatabaseSyncEngineError(format!(
-                            "failed to reinitialize CDC pragma after remote apply: {}",
-                            error
+                            "failed to reinitialize CDC pragma after remote apply: {error}",
                         ))
                     })?;
             }
