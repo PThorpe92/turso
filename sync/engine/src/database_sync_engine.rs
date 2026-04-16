@@ -115,6 +115,43 @@ fn create_changes_path(main_db_path: &str) -> String {
     format!("{main_db_path}-changes")
 }
 
+fn describe_pull_revision(revision: &Option<DatabasePullRevision>) -> String {
+    match revision {
+        Some(DatabasePullRevision::Legacy {
+            generation,
+            synced_frame_no,
+        }) => format!("legacy(generation={generation}, synced_frame_no={synced_frame_no:?})"),
+        Some(DatabasePullRevision::V1 { revision }) => format!("v1({revision})"),
+        None => "none".to_string(),
+    }
+}
+
+fn resolve_local_replay_floor_change_id(
+    logical_replay_active: bool,
+    local_pull_gen: i64,
+    remote_pull_gen: i64,
+    remote_last_change_id: Option<i64>,
+    last_pushed_pull_gen_hint: i64,
+    last_pushed_change_id_hint: i64,
+) -> Option<i64> {
+    let mut last_change_id = if remote_pull_gen == local_pull_gen {
+        remote_last_change_id
+    } else {
+        Some(0)
+    };
+
+    if logical_replay_active
+        && remote_pull_gen == local_pull_gen
+        && last_pushed_pull_gen_hint == local_pull_gen
+        && last_pushed_change_id_hint > 0
+        && last_change_id.unwrap_or(0) < last_pushed_change_id_hint
+    {
+        last_change_id = Some(last_pushed_change_id_hint);
+    }
+
+    last_change_id
+}
+
 /// caller has no access to the memory io - so we handle it here implicitly
 /// ideally, we should add necessary methods to the turso_core::IO trait - but so far I am struggling with nice interface to do that
 /// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
@@ -603,9 +640,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             result
         );
         if result.wal_max_frame < watermark {
-            return Err(Error::DatabaseSyncEngineError(
-                format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
-            ));
+            tracing::warn!(
+                "checkpoint(path={:?}): synced watermark {} is ahead of current WAL max frame {}; resetting checkpoint watermark",
+                self.main_db_path,
+                watermark,
+                result.wal_max_frame
+            );
+            self.update_meta(coro, |meta| {
+                meta.revert_since_wal_watermark = result.wal_max_frame;
+                meta.revert_since_wal_salt = main_wal_salt.clone();
+            })
+            .await?;
+            return Ok((main_wal_salt, result.wal_max_frame));
         }
         Ok((main_wal_salt, watermark))
     }
@@ -773,15 +819,45 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let file = acquire_slot(&self.changes_file)?;
 
         let now = self.io.current_time_wall_clock();
-        let revision = self.meta().synced_revision.clone();
+        let (
+            revision,
+            saved_remote_url,
+            last_pull_unix_time,
+            last_push_unix_time,
+            last_pushed_pull_gen_hint,
+            last_pushed_change_id_hint,
+        ) = {
+            let meta = self.meta();
+            (
+                meta.synced_revision.clone(),
+                meta.remote_url(),
+                meta.last_pull_unix_time,
+                meta.last_push_unix_time,
+                meta.last_pushed_pull_gen_hint,
+                meta.last_pushed_change_id_hint,
+            )
+        };
         let ctx = &SyncOperationCtx::new(
             coro,
             &self.sync_engine_io,
-            self.meta().remote_url(),
+            saved_remote_url.clone(),
             self.opts.remote_encryption_key.as_deref(),
         );
         let use_logical_mvcc_pull =
             self.opts.logical_mvcc_pull && self.opts.remote_encryption_key.is_none();
+        tracing::info!(
+            "wait_changes(path={}): remote_url={:?} revision={} client_id={} logical_mvcc_pull_requested={} logical_mvcc_pull_active={} last_pull_unix_time={:?} last_push_unix_time={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={}",
+            self.main_db_path,
+            saved_remote_url,
+            describe_pull_revision(&revision),
+            self.client_unique_id,
+            self.opts.logical_mvcc_pull,
+            use_logical_mvcc_pull,
+            last_pull_unix_time,
+            last_push_unix_time,
+            last_pushed_pull_gen_hint,
+            last_pushed_change_id_hint
+        );
         let mut logical_txns = None;
         if self.opts.logical_mvcc_pull && !use_logical_mvcc_pull {
             tracing::info!(
@@ -790,55 +866,76 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             );
         }
         let next_revision = if use_logical_mvcc_pull {
-            match &revision {
+            let logical_pull = match &revision {
                 Some(DatabasePullRevision::V1 { revision }) => {
-                    match pull_updates_v1(
+                    pull_updates_v1(
                         ctx,
                         &file.value,
                         revision,
                         self.opts.long_poll_timeout,
                         true,
                     )
-                    .await?
-                    {
-                        (next_revision, PullUpdatesV1Result::Pages) => next_revision,
-                        (next_revision, PullUpdatesV1Result::Logical(txns)) => {
-                            logical_txns = Some(txns);
-                            next_revision
-                        }
-                    }
+                    .await
                 }
                 None => {
-                    match pull_updates_v1(ctx, &file.value, "", self.opts.long_poll_timeout, true)
-                        .await?
-                    {
-                        (next_revision, PullUpdatesV1Result::Pages) => next_revision,
-                        (next_revision, PullUpdatesV1Result::Logical(txns)) => {
-                            logical_txns = Some(txns);
-                            next_revision
-                        }
-                    }
+                    pull_updates_v1(ctx, &file.value, "", self.opts.long_poll_timeout, true).await
                 }
-                Some(DatabasePullRevision::Legacy { .. }) => {
-                    wal_pull_to_file(
-                        ctx,
-                        &file.value,
-                        &revision,
-                        self.opts.wal_pull_batch_size,
-                        self.opts.long_poll_timeout,
-                    )
-                    .await?
+                Some(DatabasePullRevision::Legacy { .. }) => wal_pull_to_file(
+                    ctx,
+                    &file.value,
+                    &revision,
+                    self.opts.wal_pull_batch_size,
+                    self.opts.long_poll_timeout,
+                )
+                .await
+                .map(|revision| (revision, PullUpdatesV1Result::Pages)),
+            };
+
+            match logical_pull {
+                Ok((next_revision, PullUpdatesV1Result::Pages)) => next_revision,
+                Ok((next_revision, PullUpdatesV1Result::Logical(txns))) => {
+                    tracing::info!(
+                        "wait_changes(path={}): logical pull returned {} transactions / {} ops",
+                        self.main_db_path,
+                        txns.len(),
+                        txns.iter().map(|txn| txn.ops.len()).sum::<usize>()
+                    );
+                    logical_txns = Some(txns);
+                    next_revision
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "wait_changes(path={}): logical pull failed: revision={} remote_url={:?} err={:#}",
+                        self.main_db_path,
+                        describe_pull_revision(&revision),
+                        saved_remote_url,
+                        error
+                    );
+                    return Err(error);
                 }
             }
         } else {
-            wal_pull_to_file(
+            match wal_pull_to_file(
                 ctx,
                 &file.value,
                 &revision,
                 self.opts.wal_pull_batch_size,
                 self.opts.long_poll_timeout,
             )
-            .await?
+            .await
+            {
+                Ok(next_revision) => next_revision,
+                Err(error) => {
+                    tracing::error!(
+                        "wait_changes(path={}): page/WAL pull failed: revision={} remote_url={:?} err={:#}",
+                        self.main_db_path,
+                        describe_pull_revision(&revision),
+                        saved_remote_url,
+                        error
+                    );
+                    return Err(error);
+                }
+            }
         };
 
         let file_slot = if logical_txns.is_some() {
@@ -926,6 +1023,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         self.update_meta(coro, |m| {
             m.revert_since_wal_watermark = revert_since_wal_watermark;
             m.synced_revision = Some(remote_changes.revision);
+            m.last_pushed_pull_gen_hint = 0;
             m.last_pushed_change_id_hint = 0;
             m.last_pull_unix_time = Some(remote_changes.time.secs);
         })
@@ -1035,7 +1133,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         },
                     },
                 };
-                apply_logical_transactions_without_commit(coro, &mut replay, logical_txns).await?;
+                apply_logical_transactions_without_commit(coro, &mut replay, logical_txns)
+                    .await
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to apply remote logical transactions: {}",
+                            error
+                        ))
+                    })?;
                 tracing::info!(
                     "apply_changes(path={}): applied {} logical transactions from remote",
                     self.main_db_path,
@@ -1057,14 +1162,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
 
         let phase_conn = logical_replay_conn.as_ref().unwrap_or(&main_conn);
-        let revert_since_wal_watermark = if logical_replay_conn.is_none() {
+        if logical_replay_conn.is_none() {
             main_session.commit(0)?;
-            // now DB is equivalent to the some remote state (all local changes reverted, all remote changes applied)
-            // remember this frame watermark as a checkpoint for revert for pull operations in future
-            main_session.frames_count()?
-        } else {
-            0
-        };
+        }
+        let logical_replay_active = logical_replay_conn.is_some();
 
         // Phase 3: for raw WAL replay, the schema cookie can be arbitrary after
         // rollback/apply, so bump it to force a clean reprepare boundary. For
@@ -1092,14 +1193,32 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if remote_pull_gen > local_pull_gen {
             return Err(Error::DatabaseSyncEngineError(format!("protocol error: remote_pull_gen > local_pull_gen: {remote_pull_gen} > {local_pull_gen}")));
         }
-        let last_change_id = if remote_pull_gen == local_pull_gen {
-            // if remote_pull_gen == local_pull gen - this means that remote portion of WAL have overlap with our local changes
-            // (because we did one or more push operations since last pull) - so we need to take some suffix of local changes for replay
-            remote_last_change_id
-        } else {
-            // if remove_pull_gen < local_pull_gen - this means that remote portion of WAL have no overlaps with all our local changes and we need to replay all of them
-            Some(0)
+        let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
+            let meta = self.meta();
+            (
+                meta.last_pushed_pull_gen_hint,
+                meta.last_pushed_change_id_hint,
+            )
         };
+        let last_change_id = resolve_local_replay_floor_change_id(
+            logical_replay_active,
+            local_pull_gen,
+            remote_pull_gen,
+            remote_last_change_id,
+            last_pushed_pull_gen_hint,
+            last_pushed_change_id_hint,
+        );
+        tracing::info!(
+            "apply_changes(path={}): local replay floor: logical_replay_active={} local_pull_gen={} remote_pull_gen={} remote_last_change_id={:?} last_pushed_pull_gen_hint={} last_pushed_change_id_hint={} resolved_last_change_id={:?}",
+            self.main_db_path,
+            logical_replay_active,
+            local_pull_gen,
+            remote_pull_gen,
+            remote_last_change_id,
+            last_pushed_pull_gen_hint,
+            last_pushed_change_id_hint,
+            last_change_id,
+        );
         // Phase 5: collect local changes
         // note, that collecting chanages from main_conn will yield zero rows as we already rolled back everything from it
         // but since we didn't commited these changes yet - we can just collect changes from another connection
@@ -1133,6 +1252,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if !local_changes.is_empty() || local_rollback != 0 || remote_rollback != 0 || had_cdc_table
         {
             // first, we update last_change id in the local meta table for sync
+            if logical_replay_conn.is_none() {
+                phase_conn.reset_main_mvcc_tx_for_wal_session();
+            }
             update_last_change_id(
                 coro,
                 phase_conn,
@@ -1151,7 +1273,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if logical_replay_conn.is_none() {
                     phase_conn.reset_main_mvcc_tx_for_wal_session();
                 }
-                let _ = phase_conn.pragma_update(CDC_PRAGMA_NAME, "'full'")?;
+                let _ = phase_conn
+                    .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to reinitialize CDC pragma after remote apply: {}",
+                            error
+                        ))
+                    })?;
             }
 
             let mut replay = DatabaseReplaySession {
@@ -1207,11 +1336,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             logical_conn.publish_schema_if_newer();
             return Ok(logical_conn.wal_state()?.max_frame);
         }
+        if main_conn.has_main_mvcc_tx_for_wal_session() {
+            main_conn.commit_main_mvcc_tx_for_wal_session()?;
+        }
         main_conn.end_nested();
         main_session.wal_session.end(true)?;
         main_conn.publish_schema_if_newer();
 
-        Ok(revert_since_wal_watermark)
+        Ok(main_conn.wal_state()?.max_frame)
     }
 
     /// Sync local changes to remote DB
@@ -1226,10 +1358,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_deref(),
         );
-        let (_, change_id) =
+        let (pull_gen, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
         self.update_meta(coro, |m| {
+            m.last_pushed_pull_gen_hint = pull_gen;
             m.last_pushed_change_id_hint = change_id;
             m.last_push_unix_time = Some(self.io.current_time_wall_clock().secs);
         })
@@ -1288,5 +1421,28 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
         *self.meta.lock().unwrap() = meta;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_local_replay_floor_change_id;
+
+    #[test]
+    fn logical_replay_uses_last_pushed_hint_when_sync_row_is_stale() {
+        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 7, 34);
+        assert_eq!(floor, Some(34));
+    }
+
+    #[test]
+    fn logical_replay_ignores_last_pushed_hint_from_other_pull_generation() {
+        let floor = resolve_local_replay_floor_change_id(true, 7, 7, Some(12), 6, 34);
+        assert_eq!(floor, Some(12));
+    }
+
+    #[test]
+    fn raw_wal_replay_does_not_override_remote_overlap_with_push_hint() {
+        let floor = resolve_local_replay_floor_change_id(false, 7, 7, Some(12), 7, 34);
+        assert_eq!(floor, Some(12));
     }
 }

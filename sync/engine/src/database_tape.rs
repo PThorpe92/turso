@@ -583,7 +583,13 @@ impl DatabaseReplaySession {
                 if replay.values.is_empty() {
                     self.generator
                         .execute_ddl_idempotent(coro, &replay.sql)
-                        .await?;
+                        .await
+                        .map_err(|err| {
+                            Error::DatabaseTapeError(format!(
+                                "failed to replay DDL `{}`: {}",
+                                replay.sql, err
+                            ))
+                        })?;
                 } else {
                     let mut stmt = self.conn.prepare(&replay.sql)?;
                     replay_stmt(coro, &mut stmt, replay.values).await?;
@@ -605,7 +611,13 @@ impl DatabaseReplaySession {
                     if replay_info.change_type == DatabaseChangeType::Update {
                         self.generator
                             .execute_ddl_idempotent(coro, &replay_info.query)
-                            .await?;
+                            .await
+                            .map_err(|err| {
+                                Error::DatabaseTapeError(format!(
+                                    "failed to replay schema-table DDL `{}`: {}",
+                                    replay_info.query, err
+                                ))
+                            })?;
                     } else {
                         self.conn.execute(replay_info.query.as_str())?;
                     }
@@ -643,7 +655,13 @@ impl DatabaseReplaySession {
                                 after,
                                 None,
                             );
-                            replay_stmt(coro, &mut cached.stmt, values).await?;
+                            let debug_values_len = values.len();
+                            replay_stmt(coro, &mut cached.stmt, values)
+                                .await
+                                .map_err(|err| {
+                                    Error::DatabaseTapeError(format!(
+                                        "failed to replay insert into `{table}` with length: {debug_values_len} bound values: {err}"))
+                                })?;
                         }
                         DatabaseTapeRowChangeType::Update {
                             after,
@@ -710,7 +728,14 @@ impl DatabaseReplaySession {
                                 after,
                                 None,
                             );
-                            replay_stmt(coro, &mut cached.stmt, values).await?;
+                            let debug_values_len = values.len();
+                            replay_stmt(coro, &mut cached.stmt, values)
+                                .await
+                                .map_err(|err| {
+                                    Error::DatabaseTapeError(format!(
+                                        "failed to replay update-as-insert into `{table}` with values length: {debug_values_len} bound values: {err}"
+                                    ))
+                                })?;
                         }
                     }
                 }

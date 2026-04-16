@@ -534,7 +534,8 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
 
-                let turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body
+                let turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. } =
+                    body
                 else {
                     tracing::debug!(
                         "execute_ddl_idempotent: table {table_name} already exists and CREATE TABLE AS SELECT cannot be reconciled; skipping"

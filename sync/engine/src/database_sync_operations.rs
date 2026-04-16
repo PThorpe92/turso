@@ -12,7 +12,10 @@ use turso_core::{
     types::{Text, WalFrameInfo},
     Buffer, Completion, LimboError, OpenFlags, Value,
 };
-use turso_parser::{ast::{Cmd, Stmt as AstStmt}, parser::Parser};
+use turso_parser::{
+    ast::{Cmd, Stmt as AstStmt},
+    parser::Parser,
+};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -44,6 +47,8 @@ pub const WAL_HEADER: usize = 32;
 pub const WAL_FRAME_HEADER: usize = 24;
 pub const PAGE_SIZE: usize = 4096;
 pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
+const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
+const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
 fn pull_updates_stream_kind(header: &PullUpdatesRespProtoBody) -> Result<PullUpdatesStreamKind> {
     PullUpdatesStreamKind::try_from(header.stream_kind).map_err(|_| {
@@ -147,6 +152,12 @@ fn logical_op_to_tape_operations(
     }
 }
 
+fn is_logically_replayable_table(name: &str) -> bool {
+    name != TURSO_SYNC_TABLE_NAME
+        && name != TURSO_CDC_TABLE_NAME
+        && name != TURSO_CDC_VERSION_TABLE_NAME
+}
+
 fn schema_ddl_target(sql: &str) -> Option<(&'static str, String, bool)> {
     let mut parser = Parser::new(sql.as_bytes());
     let ast = parser.next()?.ok()?;
@@ -184,16 +195,34 @@ pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<Databa
                 return None;
             }
             let (kind, name, is_create) = schema_ddl_target(&op.sql)?;
+            if !is_logically_replayable_table(&name) {
+                return None;
+            }
             is_create.then_some((kind, name))
         })
         .collect();
     for op in txn.ops.iter().cloned() {
-        if matches!(LogicalOpType::try_from(op.op_type), Ok(LogicalOpType::SchemaDdl))
-            && matches!(
-                schema_ddl_target(&op.sql),
-                Some((kind, ref name, false)) if schema_refresh_targets.contains(&(kind, name.clone()))
-            )
+        if matches!(
+            LogicalOpType::try_from(op.op_type),
+            Ok(LogicalOpType::UpsertRow | LogicalOpType::DeleteRow)
+        ) && !is_logically_replayable_table(&op.table_name)
         {
+            continue;
+        }
+        if matches!(
+            LogicalOpType::try_from(op.op_type),
+            Ok(LogicalOpType::SchemaDdl)
+        ) && matches!(schema_ddl_target(&op.sql), Some((_, ref name, _)) if !is_logically_replayable_table(name))
+        {
+            continue;
+        }
+        if matches!(
+            LogicalOpType::try_from(op.op_type),
+            Ok(LogicalOpType::SchemaDdl)
+        ) && matches!(
+            schema_ddl_target(&op.sql),
+            Some((kind, ref name, false)) if schema_refresh_targets.contains(&(kind, name.clone()))
+        ) {
             continue;
         }
         operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
@@ -604,7 +633,13 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     long_poll_timeout: Option<std::time::Duration>,
     logical_updates: bool,
 ) -> Result<(DatabasePullRevision, PullUpdatesV1Result)> {
-    tracing::info!("pull_updates_v1: revision={revision}, logical_updates={logical_updates}");
+    tracing::info!(
+        "pull_updates_v1: remote_url={:?} revision={} logical_updates={} long_poll_timeout_ms={}",
+        ctx.remote_url,
+        revision,
+        logical_updates,
+        long_poll_timeout.map(|x| x.as_millis()).unwrap_or(0)
+    );
     let mut bytes = BytesMut::new();
 
     let request = PullUpdatesReqProtoBody {
@@ -640,7 +675,15 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
-    tracing::info!("pull_updates_v1: got header={:?}", header);
+    tracing::info!(
+        "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} db_size={} raw_encoding={:?} zstd_encoding={:?}",
+        ctx.remote_url,
+        header.server_revision,
+        header.stream_kind,
+        header.db_size,
+        header.raw_encoding,
+        header.zstd_encoding
+    );
 
     let next_revision = DatabasePullRevision::V1 {
         revision: header.server_revision.clone(),
@@ -714,6 +757,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 ctx.coro.yield_(SyncEngineIoResult::IO).await?;
             }
 
+            tracing::info!(
+                "pull_updates_v1: completed page stream: remote_url={:?} next_revision={:?}",
+                ctx.remote_url,
+                next_revision
+            );
             Ok((next_revision, PullUpdatesV1Result::Pages))
         }
         PullUpdatesStreamKind::Logical => {
@@ -728,6 +776,13 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
             {
                 txns.push(txn);
             }
+            tracing::info!(
+                "pull_updates_v1: completed logical stream: remote_url={:?} next_revision={:?} txns={} ops={}",
+                ctx.remote_url,
+                next_revision,
+                txns.len(),
+                txns.iter().map(|txn| txn.ops.len()).sum::<usize>()
+            );
             Ok((next_revision, PullUpdatesV1Result::Logical(txns)))
         }
     }
@@ -1085,9 +1140,15 @@ pub async fn update_last_change_id<Ctx>(
     tracing::info!(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
-    conn.execute(TURSO_SYNC_CREATE_TABLE)?;
-    tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
-    let mut select_stmt = conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?;
+    let mut select_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
+        Ok(stmt) => stmt,
+        Err(LimboError::ParseError(..)) => {
+            conn.execute(TURSO_SYNC_CREATE_TABLE)?;
+            tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+            conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?
+        }
+        Err(err) => return Err(err.into()),
+    };
     select_stmt.bind_at(
         1.try_into().unwrap(),
         turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
@@ -2106,8 +2167,8 @@ mod tests {
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
             apply_logical_transactions, bootstrap_db_file_v1, logical_txn_to_tape_operations,
-            pull_updates_v1, wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats,
-            SyncOperationCtx,
+            pull_updates_v1, read_last_change_id, update_last_change_id, wait_proto_message,
+            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
@@ -2115,7 +2176,10 @@ mod tests {
             LogicalOp, LogicalOpType, LogicalTxnData, PageData, PullUpdatesReqProtoBody,
             PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
-        types::{Coro, DatabasePullRevision, DatabaseRowMutation, DatabaseRowTransformResult},
+        types::{
+            Coro, DatabasePullRevision, DatabaseRowMutation, DatabaseRowTransformResult,
+            DatabaseTapeOperation,
+        },
         Result,
     };
 
@@ -2306,6 +2370,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded.stream_kind, PullUpdatesStreamKind::Logical as i32);
+    }
+
+    #[test]
+    fn logical_txn_to_tape_operations_skips_sync_metadata_tables() {
+        let txn = LogicalTxnData {
+            end_offset: 7,
+            commit_ts: 11,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "turso_sync_last_change_id".to_string(),
+                    rowid: 1,
+                    record: record(&[
+                        text_value("client-a"),
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::from_i64(2),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)".to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+
+        let ops = logical_txn_to_tape_operations(&txn).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            DatabaseTapeOperation::StmtReplay(stmt) => {
+                assert!(stmt.sql.contains("CREATE TABLE t("));
+            }
+            other => panic!("expected only user-table DDL, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2756,7 +2871,8 @@ mod tests {
                     table_name: String::new(),
                     rowid: 0,
                     record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)".to_string(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+                        .to_string(),
                     user_version: None,
                     application_id: None,
                 },
@@ -2881,6 +2997,570 @@ mod tests {
     }
 
     #[test]
+    fn apply_logical_transactions_replays_schema_refresh_backfill_and_insert() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Arc::new(DatabaseTape::new(
+            turso_core::Database::open_file(io.clone(), &db_path).unwrap(),
+        ));
+
+        let create_and_seed = LogicalTxnData {
+            end_offset: 128,
+            commit_ts: 1,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        text_value("alice"),
+                        text_value("p1"),
+                        turso_core::Value::from_i64(1),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 2,
+                    record: record(&[
+                        turso_core::Value::from_i64(2),
+                        text_value("bob"),
+                        text_value("p2"),
+                        turso_core::Value::from_i64(2),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+        let schema_refresh_and_writes = LogicalTxnData {
+            end_offset: 256,
+            commit_ts: 2,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL, note TEXT)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        text_value("alice"),
+                        text_value("p1-updated"),
+                        turso_core::Value::from_i64(3),
+                        text_value("backfilled"),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 3,
+                    record: record(&[
+                        turso_core::Value::from_i64(3),
+                        text_value("carol"),
+                        text_value("p3"),
+                        turso_core::Value::from_i64(1),
+                        text_value("new-row"),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+                    let mut replay = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    apply_logical_transactions(
+                        &coro,
+                        &mut replay,
+                        &[create_and_seed, schema_refresh_and_writes],
+                    )
+                    .await
+                    .unwrap();
+
+                    let conn = db.connect_untracked().unwrap();
+                    let mut schema_stmt = conn
+                        .prepare("SELECT sql FROM sqlite_schema WHERE name = 't'")
+                        .unwrap();
+                    let schema = run_stmt_once(&coro, &mut schema_stmt)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .get::<&str>(0)
+                        .unwrap()
+                        .to_string();
+                    assert!(
+                        schema.contains("note"),
+                        "schema should contain note after schema refresh: {schema}"
+                    );
+
+                    let mut rows = Vec::new();
+                    let mut stmt = conn
+                        .prepare("SELECT id, owner, payload, rev, note FROM t ORDER BY id")
+                        .unwrap();
+                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    assert_eq!(
+                        rows,
+                        vec![
+                            vec![
+                                turso_core::Value::from_i64(1),
+                                text_value("alice"),
+                                text_value("p1-updated"),
+                                turso_core::Value::from_i64(3),
+                                text_value("backfilled"),
+                            ],
+                            vec![
+                                turso_core::Value::from_i64(2),
+                                text_value("bob"),
+                                text_value("p2"),
+                                turso_core::Value::from_i64(2),
+                                turso_core::Value::Null,
+                            ],
+                            vec![
+                                turso_core::Value::from_i64(3),
+                                text_value("carol"),
+                                text_value("p3"),
+                                turso_core::Value::from_i64(1),
+                                text_value("new-row"),
+                            ],
+                        ]
+                    );
+
+                    Result::Ok(())
+                }
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_logical_transactions_replays_schema_refresh_with_new_index_and_backfill() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Arc::new(DatabaseTape::new(
+            turso_core::Database::open_file(io.clone(), &db_path).unwrap(),
+        ));
+
+        let create_and_seed = LogicalTxnData {
+            end_offset: 128,
+            commit_ts: 1,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        text_value("seed-a"),
+                        text_value("alpha"),
+                        turso_core::Value::from_i64(1),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 2,
+                    record: record(&[
+                        turso_core::Value::from_i64(2),
+                        text_value("seed-a"),
+                        text_value("beta"),
+                        turso_core::Value::from_i64(1),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+        let phase_two_txns = [
+            LogicalTxnData {
+                end_offset: 192,
+                commit_ts: 2,
+                ops: vec![LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL, note TEXT)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                }],
+            },
+            LogicalTxnData {
+                end_offset: 224,
+                commit_ts: 3,
+                ops: vec![LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE INDEX t_note_idx ON t(note)".to_string(),
+                    user_version: None,
+                    application_id: None,
+                }],
+            },
+            LogicalTxnData {
+                end_offset: 256,
+                commit_ts: 4,
+                ops: vec![
+                    LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: "t".to_string(),
+                        rowid: 1,
+                        record: record(&[
+                            turso_core::Value::from_i64(1),
+                            text_value("seed-a"),
+                            text_value("alpha"),
+                            turso_core::Value::from_i64(2),
+                            text_value("remote-backfill-1"),
+                        ]),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                    },
+                    LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: "t".to_string(),
+                        rowid: 2,
+                        record: record(&[
+                            turso_core::Value::from_i64(2),
+                            text_value("seed-a"),
+                            text_value("beta"),
+                            turso_core::Value::from_i64(2),
+                            text_value("remote-backfill-2"),
+                        ]),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                    },
+                    LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: "t".to_string(),
+                        rowid: 7,
+                        record: record(&[
+                            turso_core::Value::from_i64(7),
+                            text_value("remote-b"),
+                            text_value("eta"),
+                            turso_core::Value::from_i64(1),
+                            text_value("from-remote"),
+                        ]),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                    },
+                ],
+            },
+        ];
+
+        let mut gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+                    let mut replay = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let txns = std::iter::once(create_and_seed)
+                        .chain(phase_two_txns)
+                        .collect::<Vec<_>>();
+                    apply_logical_transactions(&coro, &mut replay, &txns)
+                        .await
+                        .unwrap();
+
+                    let conn = db.connect_untracked().unwrap();
+                    let mut index_stmt = conn
+                        .prepare("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 't_note_idx'")
+                        .unwrap();
+                    let index_sql = run_stmt_once(&coro, &mut index_stmt)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .get::<&str>(0)
+                        .unwrap()
+                        .to_string();
+                    assert!(
+                        index_sql.contains("note"),
+                        "index should exist on note after schema refresh: {index_sql}"
+                    );
+
+                    let mut rows = Vec::new();
+                    let mut stmt = conn
+                        .prepare("SELECT id, owner, payload, rev, note FROM t ORDER BY id")
+                        .unwrap();
+                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    assert_eq!(
+                        rows,
+                        vec![
+                            vec![
+                                turso_core::Value::from_i64(1),
+                                text_value("seed-a"),
+                                text_value("alpha"),
+                                turso_core::Value::from_i64(2),
+                                text_value("remote-backfill-1"),
+                            ],
+                            vec![
+                                turso_core::Value::from_i64(2),
+                                text_value("seed-a"),
+                                text_value("beta"),
+                                turso_core::Value::from_i64(2),
+                                text_value("remote-backfill-2"),
+                            ],
+                            vec![
+                                turso_core::Value::from_i64(7),
+                                text_value("remote-b"),
+                                text_value("eta"),
+                                turso_core::Value::from_i64(1),
+                                text_value("from-remote"),
+                            ],
+                        ]
+                    );
+
+                    Result::Ok(())
+                }
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_logical_transactions_replays_schema_refresh_in_mvcc_mode() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let raw_db = turso_core::Database::open_file(io.clone(), &db_path).unwrap();
+        let init_conn = raw_db.connect().unwrap();
+        init_conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        let db = Arc::new(DatabaseTape::new(raw_db));
+
+        let create_and_seed = LogicalTxnData {
+            end_offset: 128,
+            commit_ts: 1,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+        let schema_refresh = LogicalTxnData {
+            end_offset: 256,
+            commit_ts: 2,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)"
+                        .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::UpsertRow as i32,
+                    table_name: "t".to_string(),
+                    rowid: 1,
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        text_value("alpha-updated"),
+                        text_value("backfilled"),
+                    ]),
+                    sql: String::new(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+                    let mut replay = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    apply_logical_transactions(
+                        &coro,
+                        &mut replay,
+                        &[create_and_seed, schema_refresh],
+                    )
+                    .await
+                }
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn update_last_change_id_recreates_sync_table_in_mvcc_wal_session_after_reset() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), &db_path).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let conn = conn.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                conn.wal_insert_begin().unwrap();
+                conn.start_nested();
+
+                let state_before = read_last_change_id(&coro, &conn, "client-a").await.unwrap();
+                assert_eq!(state_before, (0, None));
+
+                conn.reset_main_mvcc_tx_for_wal_session();
+                update_last_change_id(&coro, &conn, "client-a", 1, 0)
+                    .await
+                    .unwrap();
+
+                assert!(conn.has_main_mvcc_tx_for_wal_session());
+                conn.commit_main_mvcc_tx_for_wal_session().unwrap();
+                conn.end_nested();
+                conn.wal_insert_end(true).unwrap();
+
+                let verify = turso_core::Database::open_file(io.clone(), &db_path)
+                    .unwrap()
+                    .connect()
+                    .unwrap();
+                let state_after = read_last_change_id(&coro, &verify, "client-a")
+                    .await
+                    .unwrap();
+                assert_eq!(state_after, (1, Some(0)));
+
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn apply_logical_transactions_ignores_drop_before_same_txn_create_refresh() {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
@@ -2898,7 +3578,8 @@ mod tests {
                     table_name: String::new(),
                     rowid: 0,
                     record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)".to_string(),
+                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+                        .to_string(),
                     user_version: None,
                     application_id: None,
                 },
