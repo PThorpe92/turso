@@ -160,27 +160,119 @@ fn is_logically_replayable_table(name: &str) -> bool {
 
 fn schema_ddl_target(sql: &str) -> Option<(&'static str, String, bool)> {
     let mut parser = Parser::new(sql.as_bytes());
-    let ast = parser.next()?.ok()?;
-    let Cmd::Stmt(stmt) = ast else {
+    if let Some(Ok(Cmd::Stmt(stmt))) = parser.next() {
+        return match stmt {
+            AstStmt::CreateTable { tbl_name, .. } => Some((
+                "table",
+                normalize_schema_entity_name(&tbl_name.to_string()),
+                true,
+            )),
+            AstStmt::CreateIndex { idx_name, .. } => Some((
+                "index",
+                normalize_schema_entity_name(&idx_name.to_string()),
+                true,
+            )),
+            AstStmt::CreateTrigger { trigger_name, .. } => Some((
+                "trigger",
+                normalize_schema_entity_name(&trigger_name.to_string()),
+                true,
+            )),
+            AstStmt::CreateView { view_name, .. }
+            | AstStmt::CreateMaterializedView { view_name, .. } => Some((
+                "view",
+                normalize_schema_entity_name(&view_name.to_string()),
+                true,
+            )),
+            AstStmt::DropTable { tbl_name, .. } => Some((
+                "table",
+                normalize_schema_entity_name(&tbl_name.to_string()),
+                false,
+            )),
+            AstStmt::DropIndex { idx_name, .. } => Some((
+                "index",
+                normalize_schema_entity_name(&idx_name.to_string()),
+                false,
+            )),
+            AstStmt::DropTrigger { trigger_name, .. } => Some((
+                "trigger",
+                normalize_schema_entity_name(&trigger_name.to_string()),
+                false,
+            )),
+            AstStmt::DropView { view_name, .. } => Some((
+                "view",
+                normalize_schema_entity_name(&view_name.to_string()),
+                false,
+            )),
+            _ => None,
+        };
+    }
+
+    schema_ddl_target_fallback(sql)
+}
+
+fn schema_ddl_target_fallback(sql: &str) -> Option<(&'static str, String, bool)> {
+    let sql = sql.trim();
+    for (prefix, kind, is_create) in [
+        ("CREATE MATERIALIZED VIEW", "view", true),
+        ("CREATE TABLE", "table", true),
+        ("CREATE INDEX", "index", true),
+        ("CREATE TRIGGER", "trigger", true),
+        ("CREATE VIEW", "view", true),
+        ("DROP TABLE", "table", false),
+        ("DROP INDEX", "index", false),
+        ("DROP TRIGGER", "trigger", false),
+        ("DROP VIEW", "view", false),
+    ] {
+        let Some(rest) = strip_prefix_ascii_ci(sql, prefix) else {
+            continue;
+        };
+        let (name, _) = parse_simple_sql_identifier(rest.trim_start())?;
+        return Some((kind, name, is_create));
+    }
+    None
+}
+
+fn normalize_schema_entity_name(name: &str) -> String {
+    if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
+        name[1..name.len() - 1].replace("\"\"", "\"")
+    } else {
+        name.to_string()
+    }
+}
+
+fn strip_prefix_ascii_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn parse_simple_sql_identifier(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    if let Some(rest) = input.strip_prefix('"') {
+        let mut ident = String::new();
+        let mut chars = rest.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '"' {
+                if matches!(chars.peek(), Some((_, '"'))) {
+                    ident.push('"');
+                    chars.next();
+                    continue;
+                }
+                return Some((ident, &rest[idx + ch.len_utf8()..]));
+            }
+            ident.push(ch);
+        }
         return None;
-    };
-    match stmt {
-        AstStmt::CreateTable { tbl_name, .. } => Some(("table", tbl_name.to_string(), true)),
-        AstStmt::CreateIndex { idx_name, .. } => Some(("index", idx_name.to_string(), true)),
-        AstStmt::CreateTrigger { trigger_name, .. } => {
-            Some(("trigger", trigger_name.to_string(), true))
-        }
-        AstStmt::CreateView { view_name, .. }
-        | AstStmt::CreateMaterializedView { view_name, .. } => {
-            Some(("view", view_name.to_string(), true))
-        }
-        AstStmt::DropTable { tbl_name, .. } => Some(("table", tbl_name.to_string(), false)),
-        AstStmt::DropIndex { idx_name, .. } => Some(("index", idx_name.to_string(), false)),
-        AstStmt::DropTrigger { trigger_name, .. } => {
-            Some(("trigger", trigger_name.to_string(), false))
-        }
-        AstStmt::DropView { view_name, .. } => Some(("view", view_name.to_string(), false)),
-        _ => None,
+    }
+
+    let end = input
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ';'))
+        .unwrap_or(input.len());
+    if end == 0 {
+        None
+    } else {
+        Some((input[..end].to_string(), &input[end..]))
     }
 }
 
@@ -1128,6 +1220,30 @@ pub async fn count_local_changes<Ctx>(
         _ => panic!("expected single row"),
     };
     Ok(count)
+}
+
+pub async fn max_local_change_id<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+) -> Result<Option<i64>> {
+    let mut stmt = match conn.prepare("SELECT MAX(change_id) FROM turso_cdc") {
+        Ok(stmt) => stmt,
+        Err(turso_core::LimboError::ParseError(err)) if err.contains("no such table") => {
+            return Ok(None)
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let value = match run_stmt_expect_one_row(coro, &mut stmt).await? {
+        Some(row) => row[0].clone(),
+        None => return Ok(None),
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Numeric(turso_core::Numeric::Integer(value)) => Ok(Some(value)),
+        other => Err(Error::DatabaseSyncEngineError(format!(
+            "unexpected MAX(change_id) column type: {other:?}"
+        ))),
+    }
 }
 
 pub async fn update_last_change_id<Ctx>(
@@ -2167,8 +2283,8 @@ mod tests {
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
             apply_logical_transactions, bootstrap_db_file_v1, logical_txn_to_tape_operations,
-            pull_updates_v1, read_last_change_id, update_last_change_id, wait_proto_message,
-            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            pull_updates_v1, read_last_change_id, schema_ddl_target, update_last_change_id,
+            wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
@@ -2760,6 +2876,56 @@ mod tests {
         };
         let ops = logical_txn_to_tape_operations(&txn).unwrap();
         assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn logical_txn_to_tape_operations_skips_quoted_drop_for_schema_refresh() {
+        assert_eq!(
+            schema_ddl_target("DROP table \"items\""),
+            Some(("table", "items".to_string(), false))
+        );
+        assert_eq!(
+            schema_ddl_target(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT, bucket INTEGER)"
+            ),
+            Some(("table", "items".to_string(), true))
+        );
+
+        let txn = LogicalTxnData {
+            end_offset: 9,
+            commit_ts: 22,
+            ops: vec![
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql: "DROP table \"items\"".to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+                LogicalOp {
+                    op_type: LogicalOpType::SchemaDdl as i32,
+                    table_name: String::new(),
+                    rowid: 0,
+                    record: Bytes::new(),
+                    sql:
+                        "CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT, bucket INTEGER)"
+                            .to_string(),
+                    user_version: None,
+                    application_id: None,
+                },
+            ],
+        };
+
+        let ops = logical_txn_to_tape_operations(&txn).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            DatabaseTapeOperation::StmtReplay(stmt) => {
+                assert!(stmt.sql.contains("CREATE TABLE items"));
+            }
+            other => panic!("expected CREATE TABLE replay, got {other:?}"),
+        }
     }
 
     #[test]

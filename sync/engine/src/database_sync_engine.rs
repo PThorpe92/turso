@@ -14,9 +14,10 @@ use crate::{
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
         acquire_slot, apply_logical_transactions_without_commit, apply_transformation,
-        bootstrap_db_file, connect_untracked, count_local_changes, has_table, pull_updates_v1,
-        push_logical_changes, read_last_change_id, read_wal_salt, reset_wal_file,
-        update_last_change_id, wait_all_results, wal_apply_from_file, wal_pull_to_file,
+        bootstrap_db_file, connect_untracked, count_local_changes, has_table,
+        max_local_change_id, pull_updates_v1, push_logical_changes, read_last_change_id,
+        read_wal_salt, reset_wal_file, update_last_change_id, wait_all_results,
+        wal_apply_from_file, wal_pull_to_file,
         PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
         WAL_FRAME_SIZE,
     },
@@ -981,6 +982,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<()> {
         if remote_changes.is_empty() {
             self.update_meta(coro, |m| {
+                m.synced_revision = Some(remote_changes.revision);
                 m.last_pull_unix_time = Some(remote_changes.time.secs);
             })
             .await?;
@@ -1059,6 +1061,16 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_conn.start_nested();
 
         let had_cdc_table = has_table(coro, &main_conn, "turso_cdc").await?;
+        let pre_apply_local_change_id = if had_cdc_table {
+            max_local_change_id(coro, &main_conn).await?
+        } else {
+            None
+        };
+        tracing::info!(
+            "apply_changes(path={}): pre-apply local CDC high-water mark: {:?}",
+            self.main_db_path,
+            pre_apply_local_change_id
+        );
 
         // read current pull generation from local table for the given client
         let (local_pull_gen, _) =
@@ -1220,6 +1232,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // but since we didn't commited these changes yet - we can just collect changes from another connection
         let iterate_opts = DatabaseChangesIteratorOpts {
             first_change_id: last_change_id.map(|x| x + 1),
+            last_change_id: pre_apply_local_change_id,
             mode: DatabaseChangesIteratorMode::Apply,
             ignore_schema_changes: false,
             ..Default::default()
@@ -1260,23 +1273,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             )
             .await
             .inspect_err(|e| tracing::error!("update_last_change_id failed: {e}"))?;
-
-            if had_cdc_table {
-                tracing::info!(
-                    "apply_changes(path={}): initiate CDC pragma again in order to recreate CDC table",
-                    self.main_db_path,
-                );
-                if logical_replay_conn.is_none() {
-                    phase_conn.reset_main_mvcc_tx_for_wal_session();
-                }
-                let _ = phase_conn
-                    .pragma_update(CDC_PRAGMA_NAME, "'full'")
-                    .map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!(
-                            "failed to reinitialize CDC pragma after remote apply: {error}",
-                        ))
-                    })?;
-            }
 
             let mut replay = DatabaseReplaySession {
                 conn: phase_conn.clone(),
@@ -1329,6 +1325,32 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if let Some(logical_conn) = logical_replay_conn {
             logical_conn.execute("COMMIT")?;
             logical_conn.publish_schema_if_newer();
+            if had_cdc_table {
+                tracing::info!(
+                    "apply_changes(path={}): reinitialize CDC pragma after logical replay commit",
+                    self.main_db_path,
+                );
+                logical_conn.pragma_update(CDC_PRAGMA_NAME, "'full'").map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to reinitialize CDC pragma after remote apply: {error}",
+                    ))
+                })?;
+                logical_conn.publish_schema_if_newer();
+                let change_id = max_local_change_id(coro, &logical_conn).await?.unwrap_or(0);
+                tracing::info!(
+                    "apply_changes(path={}): post-logical-replay CDC high-water mark: {}",
+                    self.main_db_path,
+                    change_id
+                );
+                update_last_change_id(
+                    coro,
+                    &logical_conn,
+                    &self.client_unique_id,
+                    local_pull_gen + 1,
+                    change_id,
+                )
+                .await?;
+            }
             return Ok(logical_conn.wal_state()?.max_frame);
         }
         if main_conn.has_main_mvcc_tx_for_wal_session() {
@@ -1337,6 +1359,32 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_conn.end_nested();
         main_session.wal_session.end(true)?;
         main_conn.publish_schema_if_newer();
+        if had_cdc_table {
+            tracing::info!(
+                "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
+                self.main_db_path,
+            );
+            main_conn.pragma_update(CDC_PRAGMA_NAME, "'full'").map_err(|error| {
+                Error::DatabaseSyncEngineError(format!(
+                    "failed to reinitialize CDC pragma after remote apply: {error}",
+                ))
+            })?;
+            main_conn.publish_schema_if_newer();
+            let change_id = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
+            tracing::info!(
+                "apply_changes(path={}): post-WAL-replay CDC high-water mark: {}",
+                self.main_db_path,
+                change_id
+            );
+            update_last_change_id(
+                coro,
+                &main_conn,
+                &self.client_unique_id,
+                local_pull_gen + 1,
+                change_id,
+            )
+            .await?;
+        }
 
         Ok(main_conn.wal_state()?.max_frame)
     }

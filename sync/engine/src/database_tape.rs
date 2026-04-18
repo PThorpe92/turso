@@ -208,6 +208,7 @@ impl DatabaseTape {
             cdc_table: self.cdc_table.clone(),
             cdc_version,
             first_change_id: opts.first_change_id,
+            last_change_id: opts.last_change_id,
             batch: VecDeque::with_capacity(opts.batch_size),
             query_stmt: None,
             txn_boundary_returned: false,
@@ -390,13 +391,18 @@ pub enum DatabaseChangesIteratorMode {
 }
 
 impl DatabaseChangesIteratorMode {
-    pub fn query(&self, table_name: &str, limit: usize) -> String {
+    pub fn query(&self, table_name: &str, limit: usize, last_change_id: Option<i64>) -> String {
         let (operation, order) = match self {
             DatabaseChangesIteratorMode::Apply => (">=", "ASC"),
             DatabaseChangesIteratorMode::Revert => ("<=", "DESC"),
         };
+        let upper_bound = match (self, last_change_id) {
+            (DatabaseChangesIteratorMode::Apply, Some(_)) => " AND change_id <= ?",
+            (DatabaseChangesIteratorMode::Revert, Some(_)) => " AND change_id >= ?",
+            (_, None) => "",
+        };
         format!(
-            "SELECT * FROM {table_name} WHERE change_id {operation} ? ORDER BY change_id {order} LIMIT {limit}",
+            "SELECT * FROM {table_name} WHERE change_id {operation} ?{upper_bound} ORDER BY change_id {order} LIMIT {limit}",
         )
     }
     pub fn first_id(&self) -> i64 {
@@ -416,6 +422,7 @@ impl DatabaseChangesIteratorMode {
 #[derive(Debug, Clone)]
 pub struct DatabaseChangesIteratorOpts {
     pub first_change_id: Option<i64>,
+    pub last_change_id: Option<i64>,
     pub batch_size: usize,
     pub mode: DatabaseChangesIteratorMode,
     pub ignore_schema_changes: bool,
@@ -425,6 +432,7 @@ impl Default for DatabaseChangesIteratorOpts {
     fn default() -> Self {
         Self {
             first_change_id: None,
+            last_change_id: None,
             batch_size: DEFAULT_CHANGES_BATCH_SIZE,
             mode: DatabaseChangesIteratorMode::Apply,
             ignore_schema_changes: true,
@@ -438,6 +446,7 @@ pub struct DatabaseChangesIterator {
     cdc_version: turso_core::CdcVersion,
     query_stmt: Option<turso_core::Statement>,
     first_change_id: Option<i64>,
+    last_change_id: Option<i64>,
     batch: VecDeque<DatabaseTapeOperation>,
     txn_boundary_returned: bool,
     mode: DatabaseChangesIteratorMode,
@@ -474,7 +483,9 @@ impl DatabaseChangesIterator {
     }
     async fn refill<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
         if self.query_stmt.is_none() {
-            let query = self.mode.query(&self.cdc_table, self.batch_size);
+            let query = self
+                .mode
+                .query(&self.cdc_table, self.batch_size, self.last_change_id);
             let stmt = match self.conn.prepare(&query) {
                 Ok(stmt) => stmt,
                 Err(LimboError::ParseError(err)) if err.contains("no such table") => return Ok(()),
@@ -490,6 +501,9 @@ impl DatabaseChangesIterator {
             1.try_into().unwrap(),
             turso_core::Value::from_i64(change_id_filter),
         );
+        if let Some(last_change_id) = self.last_change_id {
+            query_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(last_change_id));
+        }
 
         let mut last_change_id = None;
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
@@ -907,6 +921,53 @@ mod tests {
             }) if table_name == "t"
         ));
         assert!(matches!(changes[4], DatabaseTapeOperation::Commit));
+    }
+
+    #[test]
+    pub fn test_database_tape_iterate_changes_respects_upper_bound() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db1.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+                let opts = DatabaseChangesIteratorOpts {
+                    first_change_id: Some(3),
+                    last_change_id: Some(4),
+                    ..Default::default()
+                };
+                let mut iterator = db1.iterate_changes(opts).unwrap();
+                let mut changes = Vec::new();
+                while let Some(change) = iterator.next(&coro).await.unwrap() {
+                    changes.push(change);
+                }
+                changes
+            }
+        });
+        let changes = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(changes.len(), 3);
+        assert!(matches!(
+            changes[0],
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange { change_id: 3, id: 1, .. })
+        ));
+        assert!(matches!(
+            changes[1],
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange { change_id: 4, id: 2, .. })
+        ));
+        assert!(matches!(changes[2], DatabaseTapeOperation::Commit));
     }
 
     #[test]
