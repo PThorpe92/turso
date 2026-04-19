@@ -489,7 +489,10 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     tracing::info!("db_bootstrap");
     let start_time = std::time::Instant::now();
     let db_info = db_info_http(ctx).await?;
-    tracing::info!("db_bootstrap: fetched db_info={db_info:?}");
+    tracing::debug!(
+        "db_bootstrap: fetched generation={}",
+        db_info.current_generation
+    );
     let content = db_bootstrap_http(ctx, db_info.current_generation).await?;
     let mut pos = 0;
     loop {
@@ -652,8 +655,12 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
-    tracing::info!("wal_pull_to_file: got header={:?}", header);
     ensure_page_stream(&header, "wal_pull_to_file")?;
+    tracing::debug!(
+        "wal_pull_to_file: server_revision={} db_size={} stream=pages",
+        header.server_revision,
+        header.db_size
+    );
 
     let mut offset = 0;
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1253,14 +1260,14 @@ pub async fn update_last_change_id<Ctx>(
     pull_gen: i64,
     change_id: i64,
 ) -> Result<()> {
-    tracing::info!(
+    tracing::debug!(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
     let mut select_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
         Ok(stmt) => stmt,
         Err(LimboError::ParseError(..)) => {
             conn.execute(TURSO_SYNC_CREATE_TABLE)?;
-            tracing::info!("update_last_change_id(client_id={client_id}): initialized table");
+            tracing::debug!("update_last_change_id(client_id={client_id}): initialized table");
             conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?
         }
         Err(err) => return Err(err.into()),
@@ -1270,7 +1277,7 @@ pub async fn update_last_change_id<Ctx>(
         turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
     );
     let row = run_stmt_expect_one_row(coro, &mut select_stmt).await?;
-    tracing::info!("update_last_change_id(client_id={client_id}): selected client row if any");
+    tracing::trace!("update_last_change_id(client_id={client_id}): selected client row if any");
 
     if row.is_some() {
         let mut update_stmt = conn.prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
@@ -1284,7 +1291,7 @@ pub async fn update_last_change_id<Ctx>(
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
         );
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
-        tracing::info!("update_last_change_id(client_id={client_id}): updated row for the client");
+        tracing::trace!("update_last_change_id(client_id={client_id}): updated row for the client");
     } else {
         let mut update_stmt = conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
         update_stmt.bind_at(
@@ -1297,7 +1304,7 @@ pub async fn update_last_change_id<Ctx>(
             turso_core::Value::from_i64(change_id),
         );
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
-        tracing::info!(
+        tracing::trace!(
             "update_last_change_id(client_id={client_id}): inserted new row for the client"
         );
     }
@@ -1310,7 +1317,7 @@ pub async fn read_last_change_id<Ctx>(
     conn: &Arc<turso_core::Connection>,
     client_id: &str,
 ) -> Result<(i64, Option<i64>)> {
-    tracing::info!("read_last_change_id: client_id={client_id}");
+    tracing::debug!("read_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let mut select_last_change_id_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
@@ -1335,7 +1342,9 @@ pub async fn read_last_change_id<Ctx>(
             Ok((pull_gen, Some(change_id)))
         }
         None => {
-            tracing::info!("read_last_change_id: client_id={client_id}, turso_sync_last_change_id client id is not found");
+            tracing::debug!(
+                "read_last_change_id: client_id={client_id}, turso_sync_last_change_id client id is not found"
+            );
             Ok((0, None))
         }
     }
@@ -1346,11 +1355,11 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     source_conn: &Arc<turso_core::Connection>,
     client_id: &str,
 ) -> Result<(i64, Option<i64>)> {
-    tracing::info!("fetch_last_change_id: client_id={client_id}");
+    tracing::debug!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
     let (source_pull_gen, _) = read_last_change_id(ctx.coro, source_conn, client_id).await?;
-    tracing::info!(
+    tracing::debug!(
         "fetch_last_change_id: client_id={client_id}, source_pull_gen={source_pull_gen}"
     );
 
@@ -1392,7 +1401,10 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     };
     assert!(response.len() == 1);
     let last_change_id_response = &response[0];
-    tracing::debug!("fetch_last_change_id: response={:?}", response);
+    tracing::trace!(
+        "fetch_last_change_id: client_id={client_id}, response_rows={}",
+        last_change_id_response.rows.len()
+    );
     assert!(last_change_id_response.rows.len() <= 1);
     if last_change_id_response.rows.is_empty() {
         return Ok((source_pull_gen, None));
@@ -1509,7 +1521,10 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
         None
     };
 
-    tracing::debug!("local_changes: {:?}", local_changes);
+    tracing::debug!(
+        "push_logical_changes: client_id={client_id}, collected {} local changes",
+        local_changes.len()
+    );
 
     for (i, change) in local_changes.into_iter().enumerate() {
         let change_id = change.change_id;
@@ -1618,7 +1633,6 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     }
 
     if rows_changed > 0 {
-        tracing::info!("prepare update stmt for turso_sync_last_change_id table with client_id={} and last_change_id={:?}", client_id, last_change_id);
         // update turso_sync_last_change_id table with new value before commit
         let next_change_id = last_change_id.unwrap_or(0);
         tracing::info!("push_logical_changes: client_id={client_id}, set pull_gen={source_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
@@ -1639,7 +1653,11 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     }
     sql_over_http_requests.push(step("COMMIT".to_string(), Vec::new()));
 
-    tracing::debug!("hrana request: {:?}", sql_over_http_requests);
+    tracing::debug!(
+        "push_logical_changes: client_id={client_id}, request_steps={} ignored_alter_add_column_steps={}",
+        sql_over_http_requests.len(),
+        add_column_step_indices.len()
+    );
     let replay_hrana_request = server_proto::PipelineReqBody {
         baton: None,
         requests: vec![StreamRequest::Batch(BatchStreamReq {
@@ -1652,7 +1670,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     };
 
     let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
-    tracing::info!("push_logical_changes: rows_changed={:?}", rows_changed);
+    tracing::info!("push_logical_changes: client_id={client_id}, rows_changed={rows_changed}");
     Ok((source_pull_gen, last_change_id.unwrap_or(0)))
 }
 
@@ -1675,7 +1693,10 @@ pub async fn apply_transformation<IO: SyncEngineIo, Ctx>(
             changes.len()
         )));
     }
-    tracing::info!("apply_transformation: got {:?}", transformed);
+    tracing::debug!(
+        "apply_transformation: produced {} decisions",
+        transformed.len()
+    );
     Ok(transformed)
 }
 
@@ -1824,10 +1845,12 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
-    tracing::info!(
-        "bootstrap_db_file(path={}): got header={:?}",
+    tracing::debug!(
+        "bootstrap_db_file(path={}): server_revision={} db_size={} stream={:?}",
         main_db_path,
-        header
+        header.server_revision,
+        header.db_size,
+        pull_updates_stream_kind(&header)?
     );
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
@@ -2013,8 +2036,8 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
 
     let response = wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?;
     let response: server_proto::PipelineRespBody = serde_json::from_slice(&response)?;
-    tracing::debug!("hrana response: {:?}", response);
     let mut results = Vec::new();
+    let response_len = response.results.len();
     for result in response.results {
         match result {
             server_proto::StreamResult::Error { error } => {
@@ -2050,6 +2073,12 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
             },
         }
     }
+    tracing::debug!(
+        "sql_execute_http: response_streams={} stmt_results={} ignored_step_indices={}",
+        response_len,
+        results.len(),
+        ignored_step_indices.len()
+    );
     Ok(results)
 }
 

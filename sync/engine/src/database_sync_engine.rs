@@ -14,10 +14,9 @@ use crate::{
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
         acquire_slot, apply_logical_transactions_without_commit, apply_transformation,
-        bootstrap_db_file, connect_untracked, count_local_changes, has_table,
-        max_local_change_id, pull_updates_v1, push_logical_changes, read_last_change_id,
-        read_wal_salt, reset_wal_file, update_last_change_id, wait_all_results,
-        wal_apply_from_file, wal_pull_to_file,
+        bootstrap_db_file, connect_untracked, count_local_changes, has_table, max_local_change_id,
+        pull_updates_v1, push_logical_changes, read_last_change_id, read_wal_salt, reset_wal_file,
+        update_last_change_id, wait_all_results, wal_apply_from_file, wal_pull_to_file,
         PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER,
         WAL_FRAME_SIZE,
     },
@@ -1330,11 +1329,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "apply_changes(path={}): reinitialize CDC pragma after logical replay commit",
                     self.main_db_path,
                 );
-                logical_conn.pragma_update(CDC_PRAGMA_NAME, "'full'").map_err(|error| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "failed to reinitialize CDC pragma after remote apply: {error}",
-                    ))
-                })?;
+                logical_conn
+                    .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                    .map_err(|error| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "failed to reinitialize CDC pragma after remote apply: {error}",
+                        ))
+                    })?;
                 logical_conn.publish_schema_if_newer();
                 let change_id = max_local_change_id(coro, &logical_conn).await?.unwrap_or(0);
                 tracing::info!(
@@ -1364,11 +1365,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 "apply_changes(path={}): reinitialize CDC pragma after WAL replay commit",
                 self.main_db_path,
             );
-            main_conn.pragma_update(CDC_PRAGMA_NAME, "'full'").map_err(|error| {
-                Error::DatabaseSyncEngineError(format!(
-                    "failed to reinitialize CDC pragma after remote apply: {error}",
-                ))
-            })?;
+            main_conn
+                .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                .map_err(|error| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "failed to reinitialize CDC pragma after remote apply: {error}",
+                    ))
+                })?;
             main_conn.publish_schema_if_newer();
             let change_id = max_local_change_id(coro, &main_conn).await?.unwrap_or(0);
             tracing::info!(

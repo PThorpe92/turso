@@ -483,7 +483,9 @@ fn parse_args() -> Result<RunArgs> {
 }
 
 fn print_usage() {
-    println!("usage: cargo run --bin sync [--mode scripted|seeded] [--seed N] [--steps N] [--replicas N] [--check-every N]");
+    println!(
+        "usage: cargo run --manifest-path sync/engine/examples/Cargo.toml --bin sync -- [--mode scripted|seeded] [--seed N] [--steps N] [--replicas N] [--check-every N]"
+    );
 }
 
 fn default_seed() -> u64 {

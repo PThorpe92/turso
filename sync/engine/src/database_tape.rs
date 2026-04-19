@@ -502,7 +502,10 @@ impl DatabaseChangesIterator {
             turso_core::Value::from_i64(change_id_filter),
         );
         if let Some(last_change_id) = self.last_change_id {
-            query_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(last_change_id));
+            query_stmt.bind_at(
+                2.try_into().unwrap(),
+                turso_core::Value::from_i64(last_change_id),
+            );
         }
 
         let mut last_change_id = None;
@@ -961,11 +964,19 @@ mod tests {
         assert_eq!(changes.len(), 3);
         assert!(matches!(
             changes[0],
-            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange { change_id: 3, id: 1, .. })
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 3,
+                id: 1,
+                ..
+            })
         ));
         assert!(matches!(
             changes[1],
-            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange { change_id: 4, id: 2, .. })
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 4,
+                id: 2,
+                ..
+            })
         ));
         assert!(matches!(changes[2], DatabaseTapeOperation::Commit));
     }

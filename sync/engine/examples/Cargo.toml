@@ -1,5 +1,5 @@
 [package]
-name = "turso-local-examples"
+name = "turso-sync-engine-examples"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -11,10 +11,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-turso = { path = "../", features = ["sync"] }
+turso = { path = "../../../bindings/rust", features = ["sync"] }
 
 [[bin]]
 name = "sync"
-path = "src/bin/sync_mvcc_fuzz.rs"
+path = "src/bin/sync.rs"
 
 [workspace]
