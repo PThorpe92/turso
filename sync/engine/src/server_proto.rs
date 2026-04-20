@@ -63,8 +63,26 @@ pub enum PullUpdatesStreamKind {
 pub enum LogicalOpType {
     UpsertRow = 0,
     DeleteRow = 1,
-    SchemaDdl = 2,
+    Schema = 2,
     UpdateHeader = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum LogicalSchemaAction {
+    Create = 0,
+    Drop = 1,
+    Refresh = 2,
+    Alter = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum LogicalSchemaKind {
+    Table = 0,
+    Index = 1,
+    Trigger = 2,
+    View = 3,
 }
 
 #[derive(prost::Message, Clone, PartialEq, Eq)]
@@ -83,6 +101,12 @@ pub struct LogicalOp {
     pub user_version: Option<u32>,
     #[prost(optional, uint32, tag = "7")]
     pub application_id: Option<u32>,
+    #[prost(optional, enumeration = "LogicalSchemaAction", tag = "8")]
+    pub schema_action: Option<i32>,
+    #[prost(optional, enumeration = "LogicalSchemaKind", tag = "9")]
+    pub schema_kind: Option<i32>,
+    #[prost(string, tag = "10")]
+    pub schema_name: String,
 }
 
 #[derive(prost::Message, Clone, PartialEq, Eq)]

@@ -10,8 +10,8 @@ use crate::{
     database_sync_operations::WAL_FRAME_HEADER,
     errors::Error,
     types::{
-        Coro, DatabaseChange, DatabaseChangeType, DatabaseTapeOperation, DatabaseTapeRowChangeType,
-        SyncEngineIoResult,
+        Coro, DatabaseChange, DatabaseChangeType, DatabaseSchemaKind, DatabaseSchemaReplay,
+        DatabaseTapeOperation, DatabaseTapeRowChangeType, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -563,6 +563,16 @@ impl DatabaseReplaySession {
         self.cached_insert_stmt.clear();
         self.cached_update_stmt.clear();
     }
+
+    fn schema_drop_sql(kind: DatabaseSchemaKind, name: &str) -> String {
+        let object = match kind {
+            DatabaseSchemaKind::Table => "TABLE",
+            DatabaseSchemaKind::Index => "INDEX",
+            DatabaseSchemaKind::Trigger => "TRIGGER",
+            DatabaseSchemaKind::View => "VIEW",
+        };
+        format!("DROP {object} IF EXISTS {}", quote_ident(name))
+    }
 }
 
 async fn replay_stmt<Ctx>(
@@ -610,6 +620,29 @@ impl DatabaseReplaySession {
                 } else {
                     let mut stmt = self.conn.prepare(&replay.sql)?;
                     replay_stmt(coro, &mut stmt, replay.values).await?;
+                }
+                self.clear_cached_statements();
+                return Ok(());
+            }
+            DatabaseTapeOperation::SchemaReplay(replay) => {
+                self.clear_cached_statements();
+                match replay {
+                    DatabaseSchemaReplay::Create { sql }
+                    | DatabaseSchemaReplay::Refresh { sql }
+                    | DatabaseSchemaReplay::Alter { sql } => {
+                        self.generator
+                            .execute_ddl_idempotent(coro, &sql)
+                            .await
+                            .map_err(|err| {
+                                Error::DatabaseTapeError(format!(
+                                    "failed to replay schema DDL `{}`: {}",
+                                    sql, err
+                                ))
+                            })?;
+                    }
+                    DatabaseSchemaReplay::Drop { kind, name } => {
+                        self.conn.execute(Self::schema_drop_sql(kind, &name))?;
+                    }
                 }
                 self.clear_cached_statements();
                 return Ok(());
@@ -813,6 +846,10 @@ impl DatabaseReplaySession {
             .insert(key.clone(), CachedStmt { stmt, info });
         Ok(key)
     }
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[cfg(test)]

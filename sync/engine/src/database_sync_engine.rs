@@ -1245,6 +1245,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     DatabaseTapeOperation::StmtReplay(_) => {
                         panic!("changes iterator must not use StmtReplay option")
                     }
+                    DatabaseTapeOperation::SchemaReplay(_) => {
+                        panic!("changes iterator must not use SchemaReplay option")
+                    }
                     DatabaseTapeOperation::RowChange(change) => local_changes.push(change),
                     DatabaseTapeOperation::Commit => continue,
                 }

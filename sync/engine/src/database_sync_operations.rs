@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -11,10 +11,6 @@ use turso_core::{
     io::FileSyncType,
     types::{Text, WalFrameInfo},
     Buffer, Completion, LimboError, OpenFlags, Value,
-};
-use turso_parser::{
-    ast::{Cmd, Stmt as AstStmt},
-    parser::Parser,
 };
 
 use crate::{
@@ -30,14 +26,16 @@ use crate::{
     io_operations::IoOperations,
     server_proto::{
         self, Batch, BatchCond, BatchStep, BatchStreamReq, LogicalOp, LogicalOpType,
-        LogicalTxnData, PageData, PageUpdatesEncodingReq, PullUpdatesReqProtoBody,
-        PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
+        LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData, PageData, PageUpdatesEncodingReq,
+        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult,
+        StreamRequest,
     },
     types::{
         parse_bin_record, Coro, DatabasePullRevision, DatabaseRowTransformResult,
-        DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
+        DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseStatementReplay,
+        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DatabaseTapeRowChange,
+        DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus, PartialBootstrapStrategy,
+        PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -115,18 +113,71 @@ fn logical_op_to_tape_operations(
                 },
             )])
         }
-        LogicalOpType::SchemaDdl => {
-            if op.sql.is_empty() {
+        LogicalOpType::Schema => {
+            if op.schema_name.is_empty() {
                 return Err(Error::DatabaseSyncEngineError(
-                    "logical schema_ddl must include sql".to_string(),
+                    "logical schema op must include schema_name".to_string(),
                 ));
             }
-            Ok(vec![DatabaseTapeOperation::StmtReplay(
-                DatabaseStatementReplay {
-                    sql: op.sql,
-                    values: Vec::new(),
-                },
-            )])
+            let schema_action =
+                LogicalSchemaAction::try_from(op.schema_action.ok_or_else(|| {
+                    Error::DatabaseSyncEngineError(
+                        "logical schema op must include schema_action".to_string(),
+                    )
+                })?)
+                .map_err(|_| {
+                    Error::DatabaseSyncEngineError(format!(
+                        "unknown logical schema action: {:?}",
+                        op.schema_action
+                    ))
+                })?;
+            let schema_kind = logical_schema_kind(op.schema_kind.ok_or_else(|| {
+                Error::DatabaseSyncEngineError(
+                    "logical schema op must include schema_kind".to_string(),
+                )
+            })?)?;
+            let operation = match schema_action {
+                LogicalSchemaAction::Create => {
+                    if op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema create must include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create {
+                        sql: op.sql,
+                    })
+                }
+                LogicalSchemaAction::Drop => {
+                    if !op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema drop must not include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Drop {
+                        kind: schema_kind,
+                        name: op.schema_name,
+                    })
+                }
+                LogicalSchemaAction::Refresh => {
+                    if op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema refresh must include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh {
+                        sql: op.sql,
+                    })
+                }
+                LogicalSchemaAction::Alter => {
+                    if op.sql.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical schema alter must include sql".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Alter { sql: op.sql })
+                }
+            };
+            Ok(vec![operation])
         }
         LogicalOpType::UpdateHeader => {
             let mut operations = Vec::with_capacity(2);
@@ -158,141 +209,24 @@ fn is_logically_replayable_table(name: &str) -> bool {
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
 
-fn schema_ddl_target(sql: &str) -> Option<(&'static str, String, bool)> {
-    let mut parser = Parser::new(sql.as_bytes());
-    if let Some(Ok(Cmd::Stmt(stmt))) = parser.next() {
-        return match stmt {
-            AstStmt::CreateTable { tbl_name, .. } => Some((
-                "table",
-                normalize_schema_entity_name(&tbl_name.to_string()),
-                true,
-            )),
-            AstStmt::CreateIndex { idx_name, .. } => Some((
-                "index",
-                normalize_schema_entity_name(&idx_name.to_string()),
-                true,
-            )),
-            AstStmt::CreateTrigger { trigger_name, .. } => Some((
-                "trigger",
-                normalize_schema_entity_name(&trigger_name.to_string()),
-                true,
-            )),
-            AstStmt::CreateView { view_name, .. }
-            | AstStmt::CreateMaterializedView { view_name, .. } => Some((
-                "view",
-                normalize_schema_entity_name(&view_name.to_string()),
-                true,
-            )),
-            AstStmt::DropTable { tbl_name, .. } => Some((
-                "table",
-                normalize_schema_entity_name(&tbl_name.to_string()),
-                false,
-            )),
-            AstStmt::DropIndex { idx_name, .. } => Some((
-                "index",
-                normalize_schema_entity_name(&idx_name.to_string()),
-                false,
-            )),
-            AstStmt::DropTrigger { trigger_name, .. } => Some((
-                "trigger",
-                normalize_schema_entity_name(&trigger_name.to_string()),
-                false,
-            )),
-            AstStmt::DropView { view_name, .. } => Some((
-                "view",
-                normalize_schema_entity_name(&view_name.to_string()),
-                false,
-            )),
-            _ => None,
-        };
-    }
-
-    schema_ddl_target_fallback(sql)
+fn logical_schema_kind(kind: i32) -> Result<DatabaseSchemaKind> {
+    let kind = LogicalSchemaKind::try_from(kind).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!("unknown logical schema kind: {kind}"))
+    })?;
+    Ok(match kind {
+        LogicalSchemaKind::Table => DatabaseSchemaKind::Table,
+        LogicalSchemaKind::Index => DatabaseSchemaKind::Index,
+        LogicalSchemaKind::Trigger => DatabaseSchemaKind::Trigger,
+        LogicalSchemaKind::View => DatabaseSchemaKind::View,
+    })
 }
 
-fn schema_ddl_target_fallback(sql: &str) -> Option<(&'static str, String, bool)> {
-    let sql = sql.trim();
-    for (prefix, kind, is_create) in [
-        ("CREATE MATERIALIZED VIEW", "view", true),
-        ("CREATE TABLE", "table", true),
-        ("CREATE INDEX", "index", true),
-        ("CREATE TRIGGER", "trigger", true),
-        ("CREATE VIEW", "view", true),
-        ("DROP TABLE", "table", false),
-        ("DROP INDEX", "index", false),
-        ("DROP TRIGGER", "trigger", false),
-        ("DROP VIEW", "view", false),
-    ] {
-        let Some(rest) = strip_prefix_ascii_ci(sql, prefix) else {
-            continue;
-        };
-        let (name, _) = parse_simple_sql_identifier(rest.trim_start())?;
-        return Some((kind, name, is_create));
-    }
-    None
-}
-
-fn normalize_schema_entity_name(name: &str) -> String {
-    if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
-        name[1..name.len() - 1].replace("\"\"", "\"")
-    } else {
-        name.to_string()
-    }
-}
-
-fn strip_prefix_ascii_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .map(|_| &value[prefix.len()..])
-}
-
-fn parse_simple_sql_identifier(input: &str) -> Option<(String, &str)> {
-    let input = input.trim_start();
-    if let Some(rest) = input.strip_prefix('"') {
-        let mut ident = String::new();
-        let mut chars = rest.char_indices().peekable();
-        while let Some((idx, ch)) = chars.next() {
-            if ch == '"' {
-                if matches!(chars.peek(), Some((_, '"'))) {
-                    ident.push('"');
-                    chars.next();
-                    continue;
-                }
-                return Some((ident, &rest[idx + ch.len_utf8()..]));
-            }
-            ident.push(ch);
-        }
-        return None;
-    }
-
-    let end = input
-        .find(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ';'))
-        .unwrap_or(input.len());
-    if end == 0 {
-        None
-    } else {
-        Some((input[..end].to_string(), &input[end..]))
-    }
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<DatabaseTapeOperation>> {
     let mut operations = Vec::new();
-    let schema_refresh_targets: HashSet<(&'static str, String)> = txn
-        .ops
-        .iter()
-        .filter_map(|op| {
-            let op_type = LogicalOpType::try_from(op.op_type).ok()?;
-            if op_type != LogicalOpType::SchemaDdl {
-                return None;
-            }
-            let (kind, name, is_create) = schema_ddl_target(&op.sql)?;
-            if !is_logically_replayable_table(&name) {
-                return None;
-            }
-            is_create.then_some((kind, name))
-        })
-        .collect();
     for op in txn.ops.iter().cloned() {
         if matches!(
             LogicalOpType::try_from(op.op_type),
@@ -303,18 +237,9 @@ pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<Databa
         }
         if matches!(
             LogicalOpType::try_from(op.op_type),
-            Ok(LogicalOpType::SchemaDdl)
-        ) && matches!(schema_ddl_target(&op.sql), Some((_, ref name, _)) if !is_logically_replayable_table(name))
+            Ok(LogicalOpType::Schema)
+        ) && !is_logically_replayable_table(&op.schema_name)
         {
-            continue;
-        }
-        if matches!(
-            LogicalOpType::try_from(op.op_type),
-            Ok(LogicalOpType::SchemaDdl)
-        ) && matches!(
-            schema_ddl_target(&op.sql),
-            Some((kind, ref name, false)) if schema_refresh_targets.contains(&(kind, name.clone()))
-        ) {
             continue;
         }
         operations.extend(logical_op_to_tape_operations(op, txn.commit_ts)?);
@@ -1501,6 +1426,9 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             DatabaseTapeOperation::StmtReplay(_) => {
                 panic!("changes iterator must not use StmtReplay option")
             }
+            DatabaseTapeOperation::SchemaReplay(_) => {
+                panic!("changes iterator must not use SchemaReplay option")
+            }
             DatabaseTapeOperation::RowChange(change) => {
                 if change.table_name == TURSO_SYNC_TABLE_NAME {
                     continue;
@@ -1565,6 +1493,25 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
             DatabaseTapeOperation::StmtReplay(replay) => {
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
+            DatabaseTapeOperation::SchemaReplay(replay) => match replay {
+                DatabaseSchemaReplay::Create { sql }
+                | DatabaseSchemaReplay::Refresh { sql }
+                | DatabaseSchemaReplay::Alter { sql } => {
+                    sql_over_http_requests.push(step(sql, Vec::new()))
+                }
+                DatabaseSchemaReplay::Drop { kind, name } => {
+                    let object = match kind {
+                        DatabaseSchemaKind::Table => "TABLE",
+                        DatabaseSchemaKind::Index => "INDEX",
+                        DatabaseSchemaKind::Trigger => "TRIGGER",
+                        DatabaseSchemaKind::View => "VIEW",
+                    };
+                    sql_over_http_requests.push(step(
+                        format!("DROP {object} IF EXISTS {}", quote_ident(&name)),
+                        Vec::new(),
+                    ));
+                }
+            },
             DatabaseTapeOperation::RowChange(change) => {
                 let replay_info = generator.replay_info(ctx.coro, &change).await?;
                 // for now we try to support DDL statements which "extends" the schema (CREATE INDEX, CREATE TABLE, ALTER TABLE ADD COLUMN) and they have `IF NOT EXISTS` semantic
@@ -2312,18 +2259,18 @@ mod tests {
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
             apply_logical_transactions, bootstrap_db_file_v1, logical_txn_to_tape_operations,
-            pull_updates_v1, read_last_change_id, schema_ddl_target, update_last_change_id,
-            wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            pull_updates_v1, read_last_change_id, update_last_change_id, wait_proto_message,
+            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
         server_proto::{
-            LogicalOp, LogicalOpType, LogicalTxnData, PageData, PullUpdatesReqProtoBody,
-            PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+            LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
+            PageData, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
         },
         types::{
             Coro, DatabasePullRevision, DatabaseRowMutation, DatabaseRowTransformResult,
-            DatabaseTapeOperation,
+            DatabaseSchemaReplay, DatabaseTapeOperation,
         },
         Result,
     };
@@ -2506,6 +2453,71 @@ mod tests {
             .into()
     }
 
+    fn schema_op(
+        action: LogicalSchemaAction,
+        kind: LogicalSchemaKind,
+        name: &str,
+        sql: Option<&str>,
+    ) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::Schema as i32,
+            table_name: String::new(),
+            rowid: 0,
+            record: Bytes::new(),
+            sql: sql.unwrap_or_default().to_string(),
+            user_version: None,
+            application_id: None,
+            schema_action: Some(action as i32),
+            schema_kind: Some(kind as i32),
+            schema_name: name.to_string(),
+        }
+    }
+
+    fn upsert_row_op(table_name: &str, rowid: i64, record: Bytes) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::UpsertRow as i32,
+            table_name: table_name.to_string(),
+            rowid,
+            record,
+            sql: String::new(),
+            user_version: None,
+            application_id: None,
+            schema_action: None,
+            schema_kind: None,
+            schema_name: String::new(),
+        }
+    }
+
+    fn delete_row_op(table_name: &str, rowid: i64) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::DeleteRow as i32,
+            table_name: table_name.to_string(),
+            rowid,
+            record: Bytes::new(),
+            sql: String::new(),
+            user_version: None,
+            application_id: None,
+            schema_action: None,
+            schema_kind: None,
+            schema_name: String::new(),
+        }
+    }
+
+    fn header_op(user_version: Option<u32>, application_id: Option<u32>) -> LogicalOp {
+        LogicalOp {
+            op_type: LogicalOpType::UpdateHeader as i32,
+            table_name: String::new(),
+            rowid: 0,
+            record: Bytes::new(),
+            sql: String::new(),
+            user_version,
+            application_id,
+            schema_action: None,
+            schema_kind: None,
+            schema_name: String::new(),
+        }
+    }
+
     #[test]
     fn logical_header_round_trips_stream_kind() {
         let header = PullUpdatesRespProtoBody {
@@ -2528,46 +2540,37 @@ mod tests {
             end_offset: 7,
             commit_ts: 11,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "turso_sync_last_change_id".to_string(),
-                    rowid: 1,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "turso_sync_last_change_id",
+                    Some(
+                        "CREATE TABLE turso_sync_last_change_id(client_id TEXT PRIMARY KEY, pull_gen INTEGER, change_id INTEGER)",
+                    ),
+                ),
+                upsert_row_op(
+                    "turso_sync_last_change_id",
+                    1,
+                    record(&[
                         text_value("client-a"),
                         turso_core::Value::from_i64(1),
                         turso_core::Value::from_i64(2),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)".to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)"),
+                ),
             ],
         };
 
         let ops = logical_txn_to_tape_operations(&txn).unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DatabaseTapeOperation::StmtReplay(stmt) => {
-                assert!(stmt.sql.contains("CREATE TABLE t("));
+            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create { sql }) => {
+                assert!(sql.contains("CREATE TABLE t("));
             }
             other => panic!("expected only user-table DDL, got {other:?}"),
         }
@@ -2585,15 +2588,12 @@ mod tests {
         let txn = LogicalTxnData {
             end_offset: 44,
             commit_ts: 77,
-            ops: vec![LogicalOp {
-                op_type: LogicalOpType::SchemaDdl as i32,
-                table_name: String::new(),
-                rowid: 0,
-                record: Bytes::new(),
-                sql: "CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)".to_string(),
-                user_version: None,
-                application_id: None,
-            }],
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
         };
         let mut response = Vec::new();
         response.extend_from_slice(&header.encode_length_delimited_to_vec());
@@ -2793,47 +2793,28 @@ mod tests {
             end_offset: 44,
             commit_ts: 77,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)".to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: record(&[turso_core::Value::from_i64(2), text_value("beta")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[turso_core::Value::from_i64(2), text_value("beta")]),
+                ),
             ],
         };
         let delete_txn = LogicalTxnData {
             end_offset: 66,
             commit_ts: 88,
-            ops: vec![LogicalOp {
-                op_type: LogicalOpType::DeleteRow as i32,
-                table_name: "t".to_string(),
-                rowid: 2,
-                record: Bytes::new(),
-                sql: String::new(),
-                user_version: None,
-                application_id: None,
-            }],
+            ops: vec![delete_row_op("t", 2)],
         };
         let mut response = Vec::new();
         response.extend_from_slice(&header.encode_length_delimited_to_vec());
@@ -2893,67 +2874,56 @@ mod tests {
         let txn = LogicalTxnData {
             end_offset: 7,
             commit_ts: 11,
-            ops: vec![LogicalOp {
-                op_type: LogicalOpType::UpdateHeader as i32,
-                table_name: String::new(),
-                rowid: 0,
-                record: Bytes::new(),
-                sql: String::new(),
-                user_version: Some(5),
-                application_id: Some(9),
-            }],
+            ops: vec![header_op(Some(5), Some(9))],
         };
         let ops = logical_txn_to_tape_operations(&txn).unwrap();
         assert_eq!(ops.len(), 2);
     }
 
     #[test]
-    fn logical_txn_to_tape_operations_skips_quoted_drop_for_schema_refresh() {
-        assert_eq!(
-            schema_ddl_target("DROP table \"items\""),
-            Some(("table", "items".to_string(), false))
-        );
-        assert_eq!(
-            schema_ddl_target(
-                "CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT, bucket INTEGER)"
-            ),
-            Some(("table", "items".to_string(), true))
-        );
-
+    fn logical_txn_to_tape_operations_preserves_explicit_schema_refresh() {
         let txn = LogicalTxnData {
             end_offset: 9,
             commit_ts: 22,
-            ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "DROP table \"items\"".to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql:
-                        "CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT, bucket INTEGER)"
-                            .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-            ],
+            ops: vec![schema_op(
+                LogicalSchemaAction::Refresh,
+                LogicalSchemaKind::Table,
+                "items",
+                Some("CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT, bucket INTEGER)"),
+            )],
         };
 
         let ops = logical_txn_to_tape_operations(&txn).unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DatabaseTapeOperation::StmtReplay(stmt) => {
-                assert!(stmt.sql.contains("CREATE TABLE items"));
+            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh { sql }) => {
+                assert!(sql.contains("CREATE TABLE items"));
             }
-            other => panic!("expected CREATE TABLE replay, got {other:?}"),
+            other => panic!("expected schema refresh replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logical_txn_to_tape_operations_maps_schema_drop_explicitly() {
+        let txn = LogicalTxnData {
+            end_offset: 10,
+            commit_ts: 23,
+            ops: vec![schema_op(
+                LogicalSchemaAction::Drop,
+                LogicalSchemaKind::Table,
+                "items",
+                None,
+            )],
+        };
+
+        let ops = logical_txn_to_tape_operations(&txn).unwrap();
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Drop { kind, name }) => {
+                assert_eq!(*kind, crate::types::DatabaseSchemaKind::Table);
+                assert_eq!(name, "items");
+            }
+            other => panic!("expected schema drop replay, got {other:?}"),
         }
     }
 
@@ -2970,75 +2940,37 @@ mod tests {
             end_offset: 128,
             commit_ts: 1,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(a TEXT, b TEXT)".to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[text_value("a"), text_value("one")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(a TEXT, b TEXT)"),
+                ),
+                upsert_row_op("t", 1, record(&[text_value("a"), text_value("one")])),
             ],
         };
         let alter_and_update = LogicalTxnData {
             end_offset: 256,
             commit_ts: 2,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::UpdateHeader as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: String::new(),
-                    user_version: Some(77),
-                    application_id: Some(99),
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "ALTER TABLE t ADD COLUMN c TEXT DEFAULT NULL".to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[text_value("a"), text_value("ONE"), text_value("c1")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: record(&[text_value("b"), text_value("two"), text_value("c2")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::DeleteRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: Bytes::new(),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                header_op(Some(77), Some(99)),
+                schema_op(
+                    LogicalSchemaAction::Alter,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("ALTER TABLE t ADD COLUMN c TEXT DEFAULT NULL"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[text_value("a"), text_value("ONE"), text_value("c1")]),
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[text_value("b"), text_value("two"), text_value("c2")]),
+                ),
+                delete_row_op("t", 2),
             ],
         };
 
@@ -3128,54 +3060,40 @@ mod tests {
             end_offset: 128,
             commit_ts: 1,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                ),
             ],
         };
         let recreate_with_extra_column = LogicalTxnData {
             end_offset: 256,
             commit_ts: 2,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Refresh,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)",
+                    ),
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[
                         turso_core::Value::from_i64(2),
                         text_value("beta"),
                         text_value("from-remote"),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
             ],
         };
 
@@ -3271,90 +3189,66 @@ mod tests {
             end_offset: 128,
             commit_ts: 1,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[
                         turso_core::Value::from_i64(1),
                         text_value("alice"),
                         text_value("p1"),
                         turso_core::Value::from_i64(1),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: record(&[
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[
                         turso_core::Value::from_i64(2),
                         text_value("bob"),
                         text_value("p2"),
                         turso_core::Value::from_i64(2),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
             ],
         };
         let schema_refresh_and_writes = LogicalTxnData {
             end_offset: 256,
             commit_ts: 2,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL, note TEXT)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Refresh,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL, note TEXT)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[
                         turso_core::Value::from_i64(1),
                         text_value("alice"),
                         text_value("p1-updated"),
                         turso_core::Value::from_i64(3),
                         text_value("backfilled"),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 3,
-                    record: record(&[
+                ),
+                upsert_row_op(
+                    "t",
+                    3,
+                    record(&[
                         turso_core::Value::from_i64(3),
                         text_value("carol"),
                         text_value("p3"),
                         turso_core::Value::from_i64(1),
                         text_value("new-row"),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
             ],
         };
 
@@ -3459,123 +3353,92 @@ mod tests {
             end_offset: 128,
             commit_ts: 1,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[
                         turso_core::Value::from_i64(1),
                         text_value("seed-a"),
                         text_value("alpha"),
                         turso_core::Value::from_i64(1),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: record(&[
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[
                         turso_core::Value::from_i64(2),
                         text_value("seed-a"),
                         text_value("beta"),
                         turso_core::Value::from_i64(1),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
             ],
         };
         let phase_two_txns = [
             LogicalTxnData {
                 end_offset: 192,
                 commit_ts: 2,
-                ops: vec![LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL, note TEXT)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                }],
+                ops: vec![schema_op(
+                    LogicalSchemaAction::Refresh,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, owner TEXT NOT NULL, payload TEXT NOT NULL, rev INTEGER NOT NULL, note TEXT)"),
+                )],
             },
             LogicalTxnData {
                 end_offset: 224,
                 commit_ts: 3,
-                ops: vec![LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE INDEX t_note_idx ON t(note)".to_string(),
-                    user_version: None,
-                    application_id: None,
-                }],
+                ops: vec![schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Index,
+                    "t_note_idx",
+                    Some("CREATE INDEX t_note_idx ON t(note)"),
+                )],
             },
             LogicalTxnData {
                 end_offset: 256,
                 commit_ts: 4,
                 ops: vec![
-                    LogicalOp {
-                        op_type: LogicalOpType::UpsertRow as i32,
-                        table_name: "t".to_string(),
-                        rowid: 1,
-                        record: record(&[
+                    upsert_row_op(
+                        "t",
+                        1,
+                        record(&[
                             turso_core::Value::from_i64(1),
                             text_value("seed-a"),
                             text_value("alpha"),
                             turso_core::Value::from_i64(2),
                             text_value("remote-backfill-1"),
                         ]),
-                        sql: String::new(),
-                        user_version: None,
-                        application_id: None,
-                    },
-                    LogicalOp {
-                        op_type: LogicalOpType::UpsertRow as i32,
-                        table_name: "t".to_string(),
-                        rowid: 2,
-                        record: record(&[
+                    ),
+                    upsert_row_op(
+                        "t",
+                        2,
+                        record(&[
                             turso_core::Value::from_i64(2),
                             text_value("seed-a"),
                             text_value("beta"),
                             turso_core::Value::from_i64(2),
                             text_value("remote-backfill-2"),
                         ]),
-                        sql: String::new(),
-                        user_version: None,
-                        application_id: None,
-                    },
-                    LogicalOp {
-                        op_type: LogicalOpType::UpsertRow as i32,
-                        table_name: "t".to_string(),
-                        rowid: 7,
-                        record: record(&[
+                    ),
+                    upsert_row_op(
+                        "t",
+                        7,
+                        record(&[
                             turso_core::Value::from_i64(7),
                             text_value("remote-b"),
                             text_value("eta"),
                             turso_core::Value::from_i64(1),
                             text_value("from-remote"),
                         ]),
-                        sql: String::new(),
-                        user_version: None,
-                        application_id: None,
-                    },
+                    ),
                 ],
             },
         ];
@@ -3681,54 +3544,40 @@ mod tests {
             end_offset: 128,
             commit_ts: 1,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                ),
             ],
         };
         let schema_refresh = LogicalTxnData {
             end_offset: 256,
             commit_ts: 2,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Refresh,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)",
+                    ),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[
                         turso_core::Value::from_i64(1),
                         text_value("alpha-updated"),
                         text_value("backfilled"),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
             ],
         };
 
@@ -3823,7 +3672,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_logical_transactions_ignores_drop_before_same_txn_create_refresh() {
+    fn apply_logical_transactions_replays_explicit_schema_refresh() {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -3835,72 +3684,45 @@ mod tests {
             end_offset: 100,
             commit_ts: 1,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 1,
-                    record: record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 2,
-                    record: record(&[turso_core::Value::from_i64(2), text_value("beta")]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[turso_core::Value::from_i64(2), text_value("beta")]),
+                ),
             ],
         };
         let schema_refresh = LogicalTxnData {
             end_offset: 200,
             commit_ts: 2,
             ops: vec![
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "DROP table t".to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::SchemaDdl as i32,
-                    table_name: String::new(),
-                    rowid: 0,
-                    record: Bytes::new(),
-                    sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)"
-                        .to_string(),
-                    user_version: None,
-                    application_id: None,
-                },
-                LogicalOp {
-                    op_type: LogicalOpType::UpsertRow as i32,
-                    table_name: "t".to_string(),
-                    rowid: 3,
-                    record: record(&[
+                schema_op(
+                    LogicalSchemaAction::Refresh,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)",
+                    ),
+                ),
+                upsert_row_op(
+                    "t",
+                    3,
+                    record(&[
                         turso_core::Value::from_i64(3),
                         text_value("gamma"),
                         text_value("from-remote"),
                     ]),
-                    sql: String::new(),
-                    user_version: None,
-                    application_id: None,
-                },
+                ),
             ],
         };
 
@@ -3949,6 +3771,118 @@ mod tests {
                                 text_value("from-remote"),
                             ],
                         ]
+                    );
+
+                    Result::Ok(())
+                }
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_logical_transactions_replays_destructive_recreate() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Arc::new(DatabaseTape::new(
+            turso_core::Database::open_file(io.clone(), &db_path).unwrap(),
+        ));
+
+        let seed = LogicalTxnData {
+            end_offset: 100,
+            commit_ts: 1,
+            ops: vec![
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"),
+                ),
+                upsert_row_op(
+                    "t",
+                    1,
+                    record(&[turso_core::Value::from_i64(1), text_value("alpha")]),
+                ),
+                upsert_row_op(
+                    "t",
+                    2,
+                    record(&[turso_core::Value::from_i64(2), text_value("beta")]),
+                ),
+            ],
+        };
+        let destructive_recreate = LogicalTxnData {
+            end_offset: 200,
+            commit_ts: 2,
+            ops: vec![
+                schema_op(
+                    LogicalSchemaAction::Drop,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    None,
+                ),
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some(
+                        "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT NOT NULL, note TEXT)",
+                    ),
+                ),
+                upsert_row_op(
+                    "t",
+                    3,
+                    record(&[
+                        turso_core::Value::from_i64(3),
+                        text_value("gamma"),
+                        text_value("from-remote"),
+                    ]),
+                ),
+            ],
+        };
+
+        let mut gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+                    let mut replay = db
+                        .start_replay_session(
+                            &coro,
+                            DatabaseReplaySessionOpts {
+                                use_implicit_rowid: true,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    apply_logical_transactions(&coro, &mut replay, &[seed, destructive_recreate])
+                        .await
+                        .unwrap();
+
+                    let conn = db.connect_untracked().unwrap();
+                    let mut stmt = conn
+                        .prepare("SELECT id, payload, note FROM t ORDER BY id")
+                        .unwrap();
+                    let mut rows = Vec::new();
+                    while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                    }
+                    assert_eq!(
+                        rows,
+                        vec![vec![
+                            turso_core::Value::from_i64(3),
+                            text_value("gamma"),
+                            text_value("from-remote"),
+                        ]]
                     );
 
                     Result::Ok(())

@@ -503,8 +503,34 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
     StmtReplay(DatabaseStatementReplay),
+    SchemaReplay(DatabaseSchemaReplay),
     RowChange(DatabaseTapeRowChange),
     Commit,
+}
+
+#[derive(Debug)]
+pub enum DatabaseSchemaReplay {
+    Create {
+        sql: String,
+    },
+    Drop {
+        kind: DatabaseSchemaKind,
+        name: String,
+    },
+    Refresh {
+        sql: String,
+    },
+    Alter {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseSchemaKind {
+    Table,
+    Index,
+    Trigger,
+    View,
 }
 
 /// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
