@@ -6,7 +6,7 @@ use std::{
 use turso_core::{types::WalFrameInfo, LimboError, StepResult};
 
 use crate::{
-    database_replay_generator::{DatabaseReplayGenerator, ReplayInfo},
+    database_replay_generator::{decode_update_bitmap, DatabaseReplayGenerator, ReplayInfo},
     database_sync_operations::WAL_FRAME_HEADER,
     errors::Error,
     types::{
@@ -111,6 +111,17 @@ pub(crate) async fn exec_stmt<Ctx>(
     }
 }
 
+fn force_reparse_schema_with_retry(connection: &Arc<turso_core::Connection>) -> Result<()> {
+    for attempt in 0..=2 {
+        match connection.force_reparse_schema() {
+            Ok(()) => return Ok(()),
+            Err(LimboError::SchemaUpdated) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 impl DatabaseTape {
     pub fn new(database: Arc<turso_core::Database>) -> Self {
         let opts = DatabaseTapeOpts {
@@ -146,11 +157,53 @@ impl DatabaseTape {
             connection.wal_auto_checkpoint_disable();
         }
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
-        let mut stmt = connection.prepare(&self.pragma_query)?;
-        run_stmt_ignore_rows(coro, &mut stmt).await?;
+        for attempt in 0..=3 {
+            let mut stmt = match connection.prepare(&self.pragma_query) {
+                Ok(stmt) => stmt,
+                Err(LimboError::SchemaUpdated) if attempt < 3 => {
+                    force_reparse_schema_with_retry(&connection).map_err(|error| {
+                        Error::DatabaseTapeError(format!(
+                            "failed to refresh schema after CDC pragma prepare schema update: {error}",
+                        ))
+                    })?;
+                    continue;
+                }
+                Err(LimboError::SchemaUpdated) => {
+                    return Err(Error::DatabaseTapeError(
+                        "CDC pragma prepare kept seeing schema updates".to_string(),
+                    ));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match run_stmt_ignore_rows(coro, &mut stmt).await {
+                Ok(()) => break,
+                Err(Error::TursoError(LimboError::SchemaUpdated)) if attempt < 3 => {
+                    drop(stmt);
+                    force_reparse_schema_with_retry(&connection).map_err(|error| {
+                        Error::DatabaseTapeError(format!(
+                            "failed to refresh schema after CDC pragma step schema update: {error}",
+                        ))
+                    })?;
+                    continue;
+                }
+                Err(Error::TursoError(LimboError::SchemaUpdated)) => {
+                    return Err(Error::DatabaseTapeError(
+                        "CDC pragma execution kept seeing schema updates".to_string(),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         // Cache CDC version from turso_cdc_version table
         if self.cdc_version.read().unwrap().is_none() {
-            let version = Self::read_cdc_version(coro, &connection, &self.cdc_table).await?;
+            let version = match Self::read_cdc_version(coro, &connection, &self.cdc_table).await {
+                Ok(version) => version,
+                Err(Error::TursoError(LimboError::SchemaUpdated)) => {
+                    force_reparse_schema_with_retry(&connection)?;
+                    Self::read_cdc_version(coro, &connection, &self.cdc_table).await?
+                }
+                Err(error) => return Err(error),
+            };
             *self.cdc_version.write().unwrap() = Some(version);
         }
         Ok(connection)
@@ -627,15 +680,29 @@ impl DatabaseReplaySession {
             DatabaseTapeOperation::SchemaReplay(replay) => {
                 self.clear_cached_statements();
                 match replay {
-                    DatabaseSchemaReplay::Create { sql }
-                    | DatabaseSchemaReplay::Refresh { sql }
-                    | DatabaseSchemaReplay::Alter { sql } => {
+                    DatabaseSchemaReplay::Create { sql } | DatabaseSchemaReplay::Alter { sql } => {
                         self.generator
                             .execute_ddl_idempotent(coro, &sql)
                             .await
                             .map_err(|err| {
                                 Error::DatabaseTapeError(format!(
                                     "failed to replay schema DDL `{}`: {}",
+                                    sql, err
+                                ))
+                            })?;
+                    }
+                    DatabaseSchemaReplay::Refresh { kind, name, sql } => {
+                        if kind != DatabaseSchemaKind::Table {
+                            self.conn.execute(Self::schema_drop_sql(kind, &name))?;
+                        } else {
+                            let _ = name;
+                        }
+                        self.generator
+                            .execute_ddl_idempotent(coro, &sql)
+                            .await
+                            .map_err(|err| {
+                                Error::DatabaseTapeError(format!(
+                                    "failed to replay schema refresh DDL `{}`: {}",
                                     sql, err
                                 ))
                             })?;
@@ -687,7 +754,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 before,
                                 None,
-                            );
+                            )?;
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
                         DatabaseTapeRowChangeType::Insert { after } => {
@@ -704,7 +771,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 None,
-                            );
+                            )?;
                             let debug_values_len = values.len();
                             replay_stmt(coro, &mut cached.stmt, values)
                                 .await
@@ -718,15 +785,7 @@ impl DatabaseReplaySession {
                             updates: Some(updates),
                             ..
                         } => {
-                            assert!(updates.len() % 2 == 0);
-                            let columns_cnt = updates.len() / 2;
-                            let mut columns = Vec::with_capacity(columns_cnt);
-                            for value in updates.iter().take(columns_cnt) {
-                                columns.push(match value {
-                                    turso_core::Value::Numeric(turso_core::Numeric::Integer(x @ (1 | 0))) => *x > 0,
-                                    _ => panic!("unexpected 'changes' binary record first-half component: {value:?}")
-                                });
-                            }
+                            let columns = decode_update_bitmap(&updates)?;
                             let key = self.populate_update_stmt(coro, table, &columns).await?;
                             tracing::trace!(
                                 "ready to use prepared update statement for replay: key={:?}",
@@ -740,7 +799,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 Some(updates),
-                            );
+                            )?;
                             replay_stmt(coro, &mut cached.stmt, values).await?;
                         }
                         DatabaseTapeRowChangeType::Update {
@@ -761,7 +820,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 before,
                                 None,
-                            );
+                            )?;
                             replay_stmt(coro, &mut cached.stmt, values).await?;
 
                             let key = self.populate_insert_stmt(coro, table, after.len()).await?;
@@ -777,7 +836,7 @@ impl DatabaseReplaySession {
                                 change.id,
                                 after,
                                 None,
-                            );
+                            )?;
                             let debug_values_len = values.len();
                             replay_stmt(coro, &mut cached.stmt, values)
                                 .await
@@ -1094,6 +1153,96 @@ mod tests {
                     turso_core::Value::from_i64(2)
                 ]
             ]
+        );
+    }
+
+    #[test]
+    pub fn test_database_tape_replay_quoted_identifiers() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 = turso_core::Database::open_file(io.clone(), db_path1).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 = turso_core::Database::open_file(io.clone(), db_path2).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute(
+                        r#"CREATE TABLE "odd table"(
+                            "id col" INTEGER PRIMARY KEY,
+                            "payload text" TEXT
+                        )"#,
+                    )
+                    .unwrap();
+                conn1
+                    .execute(
+                        r#"INSERT INTO "odd table"("id col", "payload text")
+                           VALUES (1, 'alpha'), (2, 'remove me')"#,
+                    )
+                    .unwrap();
+                conn1
+                    .execute(
+                        r#"UPDATE "odd table"
+                           SET "payload text" = 'beta'
+                           WHERE "id col" = 1"#,
+                    )
+                    .unwrap();
+                conn1
+                    .execute(r#"DELETE FROM "odd table" WHERE "id col" = 2"#)
+                    .unwrap();
+
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                let mut stmt = conn2
+                    .prepare(
+                        r#"SELECT "id col", "payload text"
+                           FROM "odd table"
+                           ORDER BY "id col""#,
+                    )
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(rows) => break rows,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::Text(turso_core::types::Text::new("beta")),
+            ]]
         );
     }
 

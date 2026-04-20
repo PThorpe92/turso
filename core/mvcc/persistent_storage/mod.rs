@@ -35,6 +35,12 @@ pub trait DurableStorage: Send + Sync + Debug {
     fn update_header(&self) -> Result<Completion>;
 
     fn truncate(&self) -> Result<Completion>;
+
+    /// Reset the logical log to a fresh header-only file.
+    ///
+    /// Used after an external database restore so future MVCC recovery starts
+    /// from the restored image instead of replaying stale local log frames.
+    fn reset_to_fresh_header(&self) -> Result<Completion>;
     fn get_logical_log_file(&self) -> Arc<dyn File>;
     fn should_checkpoint(&self) -> bool;
     /// Set the checkpoint threshold in bytes of logical-log data written.
@@ -125,6 +131,12 @@ impl DurableStorage for Storage {
 
     fn truncate(&self) -> Result<Completion> {
         let c = self.logical_log.write().truncate()?;
+        self.shadow_offset_store(0);
+        Ok(c)
+    }
+
+    fn reset_to_fresh_header(&self) -> Result<Completion> {
+        let c = self.logical_log.write().reset_to_fresh_header()?;
         self.shadow_offset_store(0);
         Ok(c)
     }

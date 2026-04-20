@@ -60,6 +60,13 @@ pub enum PullUpdatesStreamKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
+pub enum PullUpdatesApplyMode {
+    Incremental = 0,
+    ReplaceBase = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
 pub enum LogicalOpType {
     UpsertRow = 0,
     DeleteRow = 1,
@@ -143,6 +150,8 @@ pub struct PullUpdatesRespProtoBody {
     pub zstd_encoding: Option<PageSetZstdEncodingProto>,
     #[prost(enumeration = "PullUpdatesStreamKind", tag = "5")]
     pub stream_kind: i32,
+    #[prost(enumeration = "PullUpdatesApplyMode", tag = "6")]
+    pub apply_mode: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -589,7 +589,6 @@ checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
 dependencies = [
  "getrandom 0.3.4",
  "libm",
- "rand 0.9.4",
  "siphasher",
 ]
 
@@ -2858,7 +2857,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -2880,17 +2879,19 @@ name = "turso-sync-engine-examples"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "prost",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
  "turso",
 ]
 
 [[package]]
 name = "turso_core"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "aegis",
  "aes",
@@ -2954,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -2963,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2972,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "bitflags",
  "memchr",
@@ -2985,7 +2986,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "bindgen",
  "env_logger",
@@ -2999,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3008,7 +3009,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "base64",
  "bytes",
@@ -3028,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.6.0-pre.18"
+version = "0.6.0-pre.22"
 dependencies = [
  "bindgen",
  "env_logger",

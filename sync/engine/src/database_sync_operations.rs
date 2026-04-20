@@ -27,8 +27,8 @@ use crate::{
     server_proto::{
         self, Batch, BatchCond, BatchStep, BatchStreamReq, LogicalOp, LogicalOpType,
         LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData, PageData, PageUpdatesEncodingReq,
-        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult,
-        StreamRequest,
+        PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+        PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
         parse_bin_record, Coro, DatabasePullRevision, DatabaseRowTransformResult,
@@ -45,6 +45,8 @@ pub const WAL_HEADER: usize = 32;
 pub const WAL_FRAME_HEADER: usize = 24;
 pub const PAGE_SIZE: usize = 4096;
 pub const WAL_FRAME_SIZE: usize = WAL_FRAME_HEADER + PAGE_SIZE;
+const SQLITE_INTERNAL_PREFIX: &str = "sqlite_";
+const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 const TURSO_CDC_TABLE_NAME: &str = "turso_cdc";
 const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
@@ -53,6 +55,15 @@ fn pull_updates_stream_kind(header: &PullUpdatesRespProtoBody) -> Result<PullUpd
         Error::DatabaseSyncEngineError(format!(
             "unknown pull-updates stream kind: {}",
             header.stream_kind
+        ))
+    })
+}
+
+fn pull_updates_apply_mode(header: &PullUpdatesRespProtoBody) -> Result<PullUpdatesApplyMode> {
+    PullUpdatesApplyMode::try_from(header.apply_mode).map_err(|_| {
+        Error::DatabaseSyncEngineError(format!(
+            "unknown pull-updates apply mode: {}",
+            header.apply_mode
         ))
     })
 }
@@ -119,6 +130,9 @@ fn logical_op_to_tape_operations(
                     "logical schema op must include schema_name".to_string(),
                 ));
             }
+            if !is_logically_replayable_table(&op.schema_name) {
+                return Ok(Vec::new());
+            }
             let schema_action =
                 LogicalSchemaAction::try_from(op.schema_action.ok_or_else(|| {
                     Error::DatabaseSyncEngineError(
@@ -165,6 +179,8 @@ fn logical_op_to_tape_operations(
                         ));
                     }
                     DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh {
+                        kind: schema_kind,
+                        name: op.schema_name,
                         sql: op.sql,
                     })
                 }
@@ -204,7 +220,9 @@ fn logical_op_to_tape_operations(
 }
 
 fn is_logically_replayable_table(name: &str) -> bool {
-    name != TURSO_SYNC_TABLE_NAME
+    !name.starts_with(SQLITE_INTERNAL_PREFIX)
+        && !name.starts_with(TURSO_INTERNAL_PREFIX)
+        && name != TURSO_SYNC_TABLE_NAME
         && name != TURSO_CDC_TABLE_NAME
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
@@ -264,6 +282,100 @@ async fn replay_logical_transactions<Ctx>(
     Ok(())
 }
 
+fn take_proto_message_from_bytes<T: prost::Message + Default>(
+    bytes: &mut BytesMut,
+) -> Result<Option<T>> {
+    let Some((message_length, prefix_length)) = read_varint(bytes)? else {
+        return Ok(None);
+    };
+    if message_length + prefix_length > bytes.len() {
+        return Ok(None);
+    }
+    let message = T::decode_length_delimited(&**bytes).map_err(|e| {
+        Error::DatabaseSyncEngineError(format!(
+            "unable to deserialize protobuf message from file: {e}"
+        ))
+    })?;
+    let _ = bytes.split_to(message_length + prefix_length);
+    Ok(Some(message))
+}
+
+async fn read_proto_file_chunk<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    size: u64,
+    file_offset: &mut u64,
+    bytes: &mut BytesMut,
+) -> Result<()> {
+    if *file_offset >= size {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        return Err(Error::DatabaseSyncEngineError(
+            "unexpected end of protobuf message in file".to_string(),
+        ));
+    }
+
+    let to_read = (size - *file_offset).min(64 * 1024) as usize;
+    let buffer = Arc::new(Buffer::new_temporary(to_read));
+    let read_len = Arc::new(Mutex::new(Ok(0usize)));
+    let c = Completion::new_read(buffer.clone(), {
+        let read_len = read_len.clone();
+        move |result| {
+            *read_len.lock().unwrap() = result
+                .map(|(_, len)| len as usize)
+                .map_err(|err| Error::IoError(err.to_string()));
+            None
+        }
+    });
+    let c = file.pread(*file_offset, c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    let read_len = read_len.lock().unwrap().clone()?;
+    if read_len == 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "unexpected EOF while reading protobuf messages from file".to_string(),
+        ));
+    }
+    *file_offset += read_len as u64;
+    bytes.extend_from_slice(&buffer.as_slice()[..read_len]);
+    Ok(())
+}
+
+pub async fn replay_logical_transactions_from_file<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+    commit_at_end: bool,
+) -> Result<()> {
+    let size = txns_file.size()?;
+    let mut file_offset = 0u64;
+    let mut bytes = BytesMut::new();
+    let mut saw_txns = false;
+    loop {
+        while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
+            saw_txns = true;
+            for operation in logical_txn_to_tape_operations(&txn)? {
+                replay.replay(coro, operation).await?;
+            }
+        }
+        if file_offset >= size {
+            if bytes.is_empty() {
+                break;
+            }
+            return Err(Error::DatabaseSyncEngineError(
+                "unexpected end of protobuf message in file".to_string(),
+            ));
+        }
+        read_proto_file_chunk(coro, txns_file, size, &mut file_offset, &mut bytes).await?;
+    }
+    if commit_at_end && saw_txns {
+        replay.replay(coro, DatabaseTapeOperation::Commit).await?;
+    }
+    Ok(())
+}
+
 pub async fn apply_logical_transactions<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
@@ -278,6 +390,22 @@ pub async fn apply_logical_transactions_without_commit<Ctx>(
     txns: &[LogicalTxnData],
 ) -> Result<()> {
     replay_logical_transactions(coro, replay, txns, false).await
+}
+
+pub async fn apply_logical_transactions_file<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+) -> Result<()> {
+    replay_logical_transactions_from_file(coro, replay, txns_file, true).await
+}
+
+pub async fn apply_logical_transactions_file_without_commit<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txns_file: &Arc<dyn turso_core::File>,
+) -> Result<()> {
+    replay_logical_transactions_from_file(coro, replay, txns_file, false).await
 }
 
 pub struct MutexSlot<T: Clone> {
@@ -346,8 +474,96 @@ pub enum WalPushResult {
 
 #[derive(Debug)]
 pub enum PullUpdatesV1Result {
-    Pages,
-    Logical(Vec<LogicalTxnData>),
+    Pages { replace_base: bool },
+    Logical { txns: usize, ops: usize },
+}
+
+async fn truncate_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
+    let c = Completion::new_trunc(move |result| {
+        let Ok(rc) = result else {
+            return;
+        };
+        assert!(rc as usize == 0);
+    });
+    let c = file.truncate(0, c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    Ok(())
+}
+
+async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
+    let c = Completion::new_sync(move |_| {});
+    let c = file.sync(c, FileSyncType::Fsync)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    Ok(())
+}
+
+async fn append_file_bytes<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    offset: &mut u64,
+    data: &[u8],
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let buffer = Arc::new(Buffer::new(data.to_vec()));
+    let len = data.len();
+    let c = Completion::new_write(move |result| {
+        let Ok(size) = result else {
+            return;
+        };
+        assert_eq!(size as usize, len);
+    });
+    let c = file.pwrite(*offset, buffer, c)?;
+    while !c.succeeded() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    *offset += len as u64;
+    Ok(())
+}
+
+async fn append_proto_message_to_file<Ctx, T: prost::Message>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    offset: &mut u64,
+    message: &T,
+) -> Result<()> {
+    append_file_bytes(
+        coro,
+        file,
+        offset,
+        &message.encode_length_delimited_to_vec(),
+    )
+    .await
+}
+
+pub async fn for_each_proto_message_in_file<Ctx, T: prost::Message + Default>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    mut f: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    let size = file.size()?;
+    let mut file_offset = 0u64;
+    let mut bytes = BytesMut::new();
+
+    loop {
+        while let Some(message) = take_proto_message_from_bytes::<T>(&mut bytes)? {
+            f(message)?;
+        }
+        if file_offset >= size {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            return Err(Error::DatabaseSyncEngineError(
+                "unexpected end of protobuf message in file".to_string(),
+            ));
+        }
+        read_proto_file_chunk(coro, file, size, &mut file_offset, &mut bytes).await?;
+    }
 }
 
 pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connection>> {
@@ -664,6 +880,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
         logical_updates,
         long_poll_timeout.map(|x| x.as_millis()).unwrap_or(0)
     );
+    if logical_updates && ctx.remote_encryption_key.is_some() {
+        return Err(Error::DatabaseSyncEngineError(
+            "MVCC logical pull is not supported with encrypted remote databases".to_string(),
+        ));
+    }
     let mut bytes = BytesMut::new();
 
     let request = PullUpdatesReqProtoBody {
@@ -700,10 +921,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
         ));
     };
     tracing::info!(
-        "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} db_size={} raw_encoding={:?} zstd_encoding={:?}",
+        "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} apply_mode={} db_size={} raw_encoding={:?} zstd_encoding={:?}",
         ctx.remote_url,
         header.server_revision,
         header.stream_kind,
+        header.apply_mode,
         header.db_size,
         header.raw_encoding,
         header.zstd_encoding
@@ -712,18 +934,11 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     let next_revision = DatabasePullRevision::V1 {
         revision: header.server_revision.clone(),
     };
+    let apply_mode = pull_updates_apply_mode(&header)?;
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
-            let c = Completion::new_trunc(move |result| {
-                let Ok(rc) = result else {
-                    return;
-                };
-                assert!(rc as usize == 0);
-            });
-            let c = frames_file.truncate(0, c)?;
-            while !c.succeeded() {
-                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-            }
+            let replace_base = matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase);
+            truncate_file(ctx.coro, frames_file).await?;
 
             let mut offset = 0;
             #[allow(clippy::arc_with_non_send_sync)]
@@ -775,21 +990,32 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 offset += WAL_FRAME_SIZE as u64;
             }
 
-            let c = Completion::new_sync(move |_| {});
-            let c = frames_file.sync(c, FileSyncType::Fsync)?;
-            while !c.succeeded() {
-                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-            }
+            sync_file(ctx.coro, frames_file).await?;
 
             tracing::info!(
-                "pull_updates_v1: completed page stream: remote_url={:?} next_revision={:?}",
+                "pull_updates_v1: completed page stream: remote_url={:?} next_revision={:?} replace_base={}",
                 ctx.remote_url,
-                next_revision
+                next_revision,
+                replace_base
             );
-            Ok((next_revision, PullUpdatesV1Result::Pages))
+            Ok((next_revision, PullUpdatesV1Result::Pages { replace_base }))
         }
         PullUpdatesStreamKind::Logical => {
-            let mut txns = Vec::new();
+            if matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase) {
+                return Err(Error::DatabaseSyncEngineError(
+                    "server returned replace_base apply mode with logical pull-updates stream"
+                        .to_string(),
+                ));
+            }
+            if !logical_updates {
+                return Err(Error::DatabaseSyncEngineError(
+                    "server returned a logical pull-updates stream but logical_updates was not requested".to_string(),
+                ));
+            }
+            truncate_file(ctx.coro, frames_file).await?;
+            let mut offset = 0;
+            let mut txns = 0usize;
+            let mut ops = 0usize;
             while let Some(txn) = wait_proto_message::<Ctx, LogicalTxnData>(
                 ctx.coro,
                 &completion,
@@ -798,16 +1024,19 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
             )
             .await?
             {
-                txns.push(txn);
+                ops += txn.ops.len();
+                txns += 1;
+                append_proto_message_to_file(ctx.coro, frames_file, &mut offset, &txn).await?;
             }
+            sync_file(ctx.coro, frames_file).await?;
             tracing::info!(
                 "pull_updates_v1: completed logical stream: remote_url={:?} next_revision={:?} txns={} ops={}",
                 ctx.remote_url,
                 next_revision,
-                txns.len(),
-                txns.iter().map(|txn| txn.ops.len()).sum::<usize>()
+                txns,
+                ops
             );
-            Ok((next_revision, PullUpdatesV1Result::Logical(txns)))
+            Ok((next_revision, PullUpdatesV1Result::Logical { txns, ops }))
         }
     }
 }
@@ -1188,52 +1417,70 @@ pub async fn update_last_change_id<Ctx>(
     tracing::debug!(
         "update_last_change_id(client_id={client_id}): pull_gen={pull_gen}, change_id={change_id}"
     );
-    let mut select_stmt = match conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID) {
-        Ok(stmt) => stmt,
-        Err(LimboError::ParseError(..)) => {
-            conn.execute(TURSO_SYNC_CREATE_TABLE)?;
-            tracing::debug!("update_last_change_id(client_id={client_id}): initialized table");
-            conn.prepare(TURSO_SYNC_SELECT_LAST_CHANGE_ID)?
+    for attempt in 0..=1 {
+        ensure_sync_last_change_id_table(conn, client_id)?;
+        let mut update_stmt = match conn.prepare(TURSO_SYNC_UPSERT_LAST_CHANGE_ID) {
+            Ok(stmt) => stmt,
+            Err(LimboError::ParseError(err)) if err.contains("no such table") && attempt == 0 => {
+                tracing::debug!(
+                    "update_last_change_id(client_id={client_id}): sync table missing after initialization; retrying schema initialization"
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        bind_last_change_id_upsert(&mut update_stmt, client_id, pull_gen, change_id);
+        match run_stmt_ignore_rows(coro, &mut update_stmt).await {
+            Ok(()) => {
+                tracing::trace!("update_last_change_id(client_id={client_id}): upserted sync row");
+                return Ok(());
+            }
+            Err(Error::TursoError(LimboError::ParseError(err)))
+                if err.contains("no such table") && attempt == 0 =>
+            {
+                tracing::debug!(
+                    "update_last_change_id(client_id={client_id}): sync table missing while executing upsert; retrying schema initialization"
+                );
+            }
+            Err(err) => return Err(err),
         }
-        Err(err) => return Err(err.into()),
-    };
-    select_stmt.bind_at(
+    }
+    Err(Error::DatabaseSyncEngineError(format!(
+        "failed to update sync high-water mark after retry: client_id={client_id}"
+    )))
+}
+
+fn bind_last_change_id_upsert(
+    stmt: &mut turso_core::Statement,
+    client_id: &str,
+    pull_gen: i64,
+    change_id: i64,
+) {
+    stmt.bind_at(
         1.try_into().unwrap(),
         turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
     );
-    let row = run_stmt_expect_one_row(coro, &mut select_stmt).await?;
-    tracing::trace!("update_last_change_id(client_id={client_id}): selected client row if any");
+    stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+    stmt.bind_at(
+        3.try_into().unwrap(),
+        turso_core::Value::from_i64(change_id),
+    );
+}
 
-    if row.is_some() {
-        let mut update_stmt = conn.prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
-        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
-        update_stmt.bind_at(
-            2.try_into().unwrap(),
-            turso_core::Value::from_i64(change_id),
-        );
-        update_stmt.bind_at(
-            3.try_into().unwrap(),
-            turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
-        );
-        run_stmt_ignore_rows(coro, &mut update_stmt).await?;
-        tracing::trace!("update_last_change_id(client_id={client_id}): updated row for the client");
-    } else {
-        let mut update_stmt = conn.prepare(TURSO_SYNC_INSERT_LAST_CHANGE_ID)?;
-        update_stmt.bind_at(
-            1.try_into().unwrap(),
-            turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
-        );
-        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
-        update_stmt.bind_at(
-            3.try_into().unwrap(),
-            turso_core::Value::from_i64(change_id),
-        );
-        run_stmt_ignore_rows(coro, &mut update_stmt).await?;
-        tracing::trace!(
-            "update_last_change_id(client_id={client_id}): inserted new row for the client"
-        );
+fn ensure_sync_last_change_id_table(
+    conn: &Arc<turso_core::Connection>,
+    client_id: &str,
+) -> Result<()> {
+    match conn.execute(TURSO_SYNC_CREATE_TABLE) {
+        Ok(()) => {}
+        Err(LimboError::ParseError(err)) if err.contains("already exists") => {
+            tracing::debug!(
+                "update_last_change_id(client_id={client_id}): sync table already exists while initializing; refreshing schema"
+            );
+        }
+        Err(err) => return Err(err.into()),
     }
-
+    conn.publish_schema_if_newer();
     Ok(())
 }
 
@@ -1494,9 +1741,22 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                 sql_over_http_requests.push(step(replay.sql, convert_to_args(replay.values)))
             }
             DatabaseTapeOperation::SchemaReplay(replay) => match replay {
-                DatabaseSchemaReplay::Create { sql }
-                | DatabaseSchemaReplay::Refresh { sql }
-                | DatabaseSchemaReplay::Alter { sql } => {
+                DatabaseSchemaReplay::Create { sql } | DatabaseSchemaReplay::Alter { sql } => {
+                    sql_over_http_requests.push(step(sql, Vec::new()))
+                }
+                DatabaseSchemaReplay::Refresh { kind, name, sql } => {
+                    if kind != DatabaseSchemaKind::Table {
+                        let object = match kind {
+                            DatabaseSchemaKind::Table => unreachable!(),
+                            DatabaseSchemaKind::Index => "INDEX",
+                            DatabaseSchemaKind::Trigger => "TRIGGER",
+                            DatabaseSchemaKind::View => "VIEW",
+                        };
+                        sql_over_http_requests.push(step(
+                            format!("DROP {object} IF EXISTS {}", quote_ident(&name)),
+                            Vec::new(),
+                        ));
+                    }
                     sql_over_http_requests.push(step(sql, Vec::new()))
                 }
                 DatabaseSchemaReplay::Drop { kind, name } => {
@@ -1526,7 +1786,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             change.id,
                             before,
                             None,
-                        );
+                        )?;
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)))
                     }
@@ -1537,7 +1797,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             change.id,
                             after,
                             None,
-                        );
+                        )?;
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
                     }
@@ -1552,7 +1812,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             change.id,
                             after,
                             Some(updates),
-                        );
+                        )?;
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
                     }
@@ -1567,7 +1827,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                             change.id,
                             after,
                             None,
-                        );
+                        )?;
                         sql_over_http_requests
                             .push(step(replay_info.query.clone(), convert_to_args(values)));
                     }
@@ -1799,9 +2059,9 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
         header.db_size,
         pull_updates_stream_kind(&header)?
     );
+    let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
-            let file = io.open_file(main_db_path, OpenFlags::Create, false)?;
             let c = Completion::new_trunc(move |result| {
                 let Ok(rc) = result else {
                     return;
@@ -1851,7 +2111,17 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             }
         }
         PullUpdatesStreamKind::Logical => {
-            let mut txns = Vec::new();
+            if !logical_updates {
+                return Err(Error::DatabaseSyncEngineError(
+                    "server returned a logical bootstrap stream but logical_updates was not requested".to_string(),
+                ));
+            }
+            let logical_txn_path = format!("{main_db_path}-bootstrap-logical");
+            let logical_txn_file = io.open_file(&logical_txn_path, OpenFlags::Create, false)?;
+            truncate_file(ctx.coro, &logical_txn_file).await?;
+            let mut offset = 0u64;
+            let mut txns = 0usize;
+            let mut ops = 0usize;
             while let Some(txn) = wait_proto_message::<Ctx, LogicalTxnData>(
                 ctx.coro,
                 &completion,
@@ -1860,8 +2130,12 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             )
             .await?
             {
-                txns.push(txn);
+                ops += txn.ops.len();
+                txns += 1;
+                append_proto_message_to_file(ctx.coro, &logical_txn_file, &mut offset, &txn)
+                    .await?;
             }
+            sync_file(ctx.coro, &logical_txn_file).await?;
 
             let db = turso_core::Database::open_file(io.clone(), main_db_path)?;
             let conn = db.connect()?;
@@ -1878,7 +2152,13 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
                     },
                 },
             };
-            apply_logical_transactions(ctx.coro, &mut replay, &txns).await?;
+            apply_logical_transactions_file(ctx.coro, &mut replay, &logical_txn_file).await?;
+            tracing::debug!(
+                "bootstrap_db_file(path={}): replayed logical bootstrap txns={} ops={}",
+                main_db_path,
+                txns,
+                ops
+            );
         }
     }
     Ok(DatabasePullRevision::V1 {
@@ -2031,8 +2311,18 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
 
 fn is_alter_table_add_column(sql: &str) -> bool {
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
-    let Some(Ok(ast)) = parser.next() else {
+    let Some(ast) = parser.next() else {
+        tracing::debug!("is_alter_table_add_column: empty SQL");
         return false;
+    };
+    let ast = match ast {
+        Ok(ast) => ast,
+        Err(err) => {
+            tracing::debug!(
+                "is_alter_table_add_column: failed to parse SQL as ALTER TABLE ADD COLUMN: sql={sql:?} err={err}"
+            );
+            return false;
+        }
     };
     matches!(
         ast,
@@ -2255,25 +2545,30 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::{
+        database_replay_generator::decode_update_bitmap,
         database_sync_engine::DataStats,
         database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
         database_sync_operations::{
-            apply_logical_transactions, bootstrap_db_file_v1, logical_txn_to_tape_operations,
-            pull_updates_v1, read_last_change_id, update_last_change_id, wait_proto_message,
-            PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            apply_logical_transactions, bootstrap_db_file_v1, for_each_proto_message_in_file,
+            logical_txn_to_tape_operations, pull_updates_v1, read_last_change_id,
+            update_last_change_id, wait_proto_message, PullUpdatesV1Result, SyncEngineIoStats,
+            SyncOperationCtx, TURSO_SYNC_CREATE_TABLE,
         },
         database_tape::run_stmt_once,
         database_tape::{DatabaseReplaySessionOpts, DatabaseTape},
+        errors::Error,
         server_proto::{
             LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
-            PageData, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+            PageData, PullUpdatesApplyMode, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
+            PullUpdatesStreamKind,
         },
         types::{
             Coro, DatabasePullRevision, DatabaseRowMutation, DatabaseRowTransformResult,
-            DatabaseSchemaReplay, DatabaseTapeOperation,
+            DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseTapeOperation,
         },
         Result,
     };
+    use turso_core::types::Text;
 
     struct TestPollResult(Vec<u8>);
 
@@ -2518,6 +2813,19 @@ mod tests {
         }
     }
 
+    async fn read_logical_txns_from_file<Ctx>(
+        coro: &Coro<Ctx>,
+        file: &Arc<dyn turso_core::File>,
+    ) -> Result<Vec<LogicalTxnData>> {
+        let txns = RefCell::new(Vec::new());
+        for_each_proto_message_in_file::<Ctx, LogicalTxnData>(coro, file, |txn| {
+            txns.borrow_mut().push(txn);
+            Ok(())
+        })
+        .await?;
+        Ok(txns.into_inner())
+    }
+
     #[test]
     fn logical_header_round_trips_stream_kind() {
         let header = PullUpdatesRespProtoBody {
@@ -2526,6 +2834,7 @@ mod tests {
             raw_encoding: Some(crate::server_proto::PageSetRawEncodingProto {}),
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Logical as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
         };
         let decoded = PullUpdatesRespProtoBody::decode_length_delimited(
             header.encode_length_delimited_to_vec().as_slice(),
@@ -2559,6 +2868,28 @@ mod tests {
                 ),
                 schema_op(
                     LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Index,
+                    "sqlite_autoindex_t_1",
+                    Some("CREATE INDEX sqlite_autoindex_t_1 ON t(id)"),
+                ),
+                upsert_row_op(
+                    "sqlite_stat1",
+                    1,
+                    record(&[text_value("t"), text_value("idx"), text_value("1 1")]),
+                ),
+                schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "__turso_internal_shadow",
+                    Some("CREATE TABLE __turso_internal_shadow(id INTEGER PRIMARY KEY)"),
+                ),
+                upsert_row_op(
+                    "__turso_internal_shadow",
+                    1,
+                    record(&[turso_core::Value::from_i64(1)]),
+                ),
+                schema_op(
+                    LogicalSchemaAction::Create,
                     LogicalSchemaKind::Table,
                     "t",
                     Some("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)"),
@@ -2577,6 +2908,32 @@ mod tests {
     }
 
     #[test]
+    fn malformed_update_bitmap_returns_error_instead_of_panicking() {
+        let err = decode_update_bitmap(&[
+            turso_core::Value::Text(Text::new("not-a-flag".to_string())),
+            turso_core::Value::Null,
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::DatabaseSyncEngineError(_)),
+            "malformed update bitmap should surface as sync-engine error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_add_column_detection_handles_quoted_identifiers_and_expressions() {
+        assert!(super::is_alter_table_add_column(
+            r#"ALTER TABLE "odd table" ADD COLUMN "new col" TEXT DEFAULT ('x')"#
+        ));
+        assert!(!super::is_alter_table_add_column(
+            r#"ALTER TABLE "odd table" RENAME TO "new table""#
+        ));
+        assert!(!super::is_alter_table_add_column(
+            r#"ALTER TABLE "odd table" ADD"#
+        ));
+    }
+
+    #[test]
     fn pull_updates_v1_decodes_logical_stream_and_sets_request_flag() {
         let header = PullUpdatesRespProtoBody {
             server_revision: "g1:o44".to_string(),
@@ -2584,6 +2941,7 @@ mod tests {
             raw_encoding: None,
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Logical as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
         };
         let txn = LogicalTxnData {
             end_offset: 44,
@@ -2629,16 +2987,95 @@ mod tests {
                     panic!("expected V1 revision");
                 };
                 assert_eq!(revision, "g1:o44");
-                assert_eq!(file.size().unwrap(), 0);
                 match result {
-                    PullUpdatesV1Result::Logical(txns) => assert_eq!(txns, vec![txn]),
-                    PullUpdatesV1Result::Pages => panic!("expected logical stream"),
+                    PullUpdatesV1Result::Logical { txns, ops } => {
+                        assert_eq!(txns, 1);
+                        assert_eq!(ops, 1);
+                    }
+                    PullUpdatesV1Result::Pages { .. } => panic!("expected logical stream"),
                 }
+                assert_eq!(
+                    read_logical_txns_from_file(&coro, &file).await.unwrap(),
+                    vec![txn]
+                );
                 let (method, path, body) = io.request.lock().unwrap().clone().unwrap();
                 assert_eq!(method, "POST");
                 assert_eq!(path, "/pull-updates");
                 let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
                 assert!(request.logical_updates);
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn pull_updates_v1_rejects_logical_stream_without_request_flag() {
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o44".to_string(),
+            db_size: 0,
+            raw_encoding: None,
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Logical as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
+        };
+        let txn = LogicalTxnData {
+            end_offset: 44,
+            commit_ts: 77,
+            ops: vec![schema_op(
+                LogicalSchemaAction::Create,
+                LogicalSchemaKind::Table,
+                "t",
+                Some("CREATE TABLE t(x INTEGER PRIMARY KEY, y TEXT)"),
+            )],
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&txn.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 5,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path, turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let err = pull_updates_v1(&ctx, &file, "g1:o40", None, false)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("logical_updates was not requested"),
+                    "unexpected error: {err:?}"
+                );
+                let (method, path, body) = io.request.lock().unwrap().clone().unwrap();
+                assert_eq!(method, "POST");
+                assert_eq!(path, "/pull-updates");
+                let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
+                assert!(!request.logical_updates);
                 Result::Ok(())
             }
         });
@@ -2659,6 +3096,7 @@ mod tests {
             raw_encoding: Some(crate::server_proto::PageSetRawEncodingProto {}),
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
         };
         let page_data = PageData {
             page_id: 0,
@@ -2699,8 +3137,13 @@ mod tests {
                 };
                 assert_eq!(revision, "g1:o45");
                 match result {
-                    PullUpdatesV1Result::Pages => {}
-                    PullUpdatesV1Result::Logical(_) => panic!("expected page stream"),
+                    PullUpdatesV1Result::Pages {
+                        replace_base: false,
+                    } => {}
+                    PullUpdatesV1Result::Pages { replace_base: true } => {
+                        panic!("expected incremental page stream")
+                    }
+                    PullUpdatesV1Result::Logical { .. } => panic!("expected page stream"),
                 }
                 let bytes = std::fs::read(path).unwrap();
                 assert_eq!(bytes.len(), super::WAL_FRAME_SIZE);
@@ -2722,13 +3165,89 @@ mod tests {
     }
 
     #[test]
-    fn pull_updates_v1_sends_encryption_header_for_logical_pull() {
+    fn pull_updates_v1_reports_replace_base_page_stream() {
+        let page = vec![9u8; super::PAGE_SIZE];
+        let header = PullUpdatesRespProtoBody {
+            server_revision: "g1:o99".to_string(),
+            db_size: 1,
+            raw_encoding: Some(crate::server_proto::PageSetRawEncodingProto {}),
+            zstd_encoding: None,
+            stream_kind: PullUpdatesStreamKind::Pages as i32,
+            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+        };
+        let page_data = PageData {
+            page_id: 0,
+            encoded_page: page.clone().into(),
+        };
+        let mut response = Vec::new();
+        response.extend_from_slice(&header.encode_length_delimited_to_vec());
+        response.extend_from_slice(&page_data.encode_length_delimited_to_vec());
+
+        let io = Arc::new(TestHttpIo {
+            response,
+            chunk: 13,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let temp = NamedTempFile::new().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let file = core_io
+            .open_file(path, turso_core::OpenFlags::Create, false)
+            .unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let file = file.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    None,
+                );
+                let (revision, result) = pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                let DatabasePullRevision::V1 { revision } = revision else {
+                    panic!("expected V1 revision");
+                };
+                assert_eq!(revision, "g1:o99");
+                match result {
+                    PullUpdatesV1Result::Pages { replace_base: true } => {}
+                    PullUpdatesV1Result::Pages {
+                        replace_base: false,
+                    } => panic!("expected replace-base page stream"),
+                    PullUpdatesV1Result::Logical { .. } => panic!("expected page stream"),
+                }
+                let bytes = std::fs::read(path).unwrap();
+                assert_eq!(bytes.len(), super::WAL_FRAME_SIZE);
+                let info = turso_core::types::WalFrameInfo::from_frame_header(
+                    &bytes[..super::WAL_FRAME_HEADER],
+                );
+                assert_eq!(info.page_no, 1);
+                assert_eq!(info.db_size, 1);
+                assert_eq!(&bytes[super::WAL_FRAME_HEADER..], page.as_slice());
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn pull_updates_v1_rejects_remote_encryption_for_logical_pull() {
         let header = PullUpdatesRespProtoBody {
             server_revision: "g1:o44".to_string(),
             db_size: 0,
             raw_encoding: None,
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Logical as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
         };
         let mut response = Vec::new();
         response.extend_from_slice(&header.encode_length_delimited_to_vec());
@@ -2758,12 +3277,52 @@ mod tests {
                     Some("https://example.com".to_string()),
                     Some("dGVzdC1lbmNyeXB0aW9uLWtleQ=="),
                 );
-                let (_revision, result) =
-                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
-                match result {
-                    PullUpdatesV1Result::Logical(txns) => assert!(txns.is_empty()),
-                    PullUpdatesV1Result::Pages => panic!("expected logical stream"),
-                }
+                let err = pull_updates_v1(&ctx, &file, "g1:o40", None, true)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    err.to_string()
+                        .contains("not supported with encrypted remote databases"),
+                    "unexpected error: {err:?}"
+                );
+                assert!(io.request.lock().unwrap().is_none());
+                assert!(io.headers.lock().unwrap().is_empty());
+                Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => {}
+                genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
+            }
+        }
+    }
+
+    #[test]
+    fn db_bootstrap_http_sends_encryption_header_for_export() {
+        let io = Arc::new(TestHttpIo {
+            response: Vec::new(),
+            chunk: 32,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let stats = SyncEngineIoStats::new(io.clone());
+                let ctx = SyncOperationCtx::new(
+                    &coro,
+                    &stats,
+                    Some("https://example.com".to_string()),
+                    Some("dGVzdC1lbmNyeXB0aW9uLWtleQ=="),
+                );
+                let _completion = super::db_bootstrap_http(&ctx, 42).await?;
+                let (method, path, body) = io.request.lock().unwrap().clone().unwrap();
+                assert_eq!(method, "GET");
+                assert_eq!(path, "/export/42");
+                assert!(body.is_empty());
 
                 let headers = io.headers.lock().unwrap().clone();
                 assert!(headers.iter().any(|(name, value)| {
@@ -2788,6 +3347,7 @@ mod tests {
             raw_encoding: None,
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Logical as i32,
+            apply_mode: PullUpdatesApplyMode::Incremental as i32,
         };
         let create_txn = LogicalTxnData {
             end_offset: 44,
@@ -2896,7 +3456,13 @@ mod tests {
         let ops = logical_txn_to_tape_operations(&txn).unwrap();
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh { sql }) => {
+            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh {
+                kind,
+                name,
+                sql,
+            }) => {
+                assert_eq!(*kind, DatabaseSchemaKind::Table);
+                assert_eq!(name, "items");
                 assert!(sql.contains("CREATE TABLE items"));
             }
             other => panic!("expected schema refresh replay, got {other:?}"),
@@ -3531,6 +4097,87 @@ mod tests {
     }
 
     #[test]
+    fn apply_logical_transactions_retries_create_index_idempotently() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Arc::new(DatabaseTape::new(
+            turso_core::Database::open_file(io.clone(), &db_path).unwrap(),
+        ));
+
+        let txns = vec![
+            LogicalTxnData {
+                end_offset: 128,
+                commit_ts: 1,
+                ops: vec![schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Table,
+                    "t",
+                    Some("CREATE TABLE t(id INTEGER PRIMARY KEY, note TEXT)"),
+                )],
+            },
+            LogicalTxnData {
+                end_offset: 256,
+                commit_ts: 2,
+                ops: vec![schema_op(
+                    LogicalSchemaAction::Create,
+                    LogicalSchemaKind::Index,
+                    "t_note_idx",
+                    Some("CREATE INDEX t_note_idx ON t(note)"),
+                )],
+            },
+        ];
+
+        let mut gen = genawaiter::sync::Gen::new({
+            move |coro| {
+                let db = db.clone();
+                let txns = txns.clone();
+                async move {
+                    let coro: Coro<()> = coro.into();
+
+                    for _ in 0..2 {
+                        let mut replay = db
+                            .start_replay_session(
+                                &coro,
+                                DatabaseReplaySessionOpts {
+                                    use_implicit_rowid: true,
+                                },
+                            )
+                            .await
+                            .unwrap();
+                        apply_logical_transactions(&coro, &mut replay, &txns)
+                            .await
+                            .unwrap();
+                    }
+
+                    let conn = db.connect_untracked().unwrap();
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 't_note_idx'",
+                        )
+                        .unwrap();
+                    let row = run_stmt_once(&coro, &mut stmt).await.unwrap().unwrap();
+                    let sql = row.get::<&str>(0).unwrap().to_string();
+                    assert!(sql.contains("CREATE INDEX"));
+                    assert!(run_stmt_once(&coro, &mut stmt).await.unwrap().is_none());
+
+                    Result::Ok(())
+                }
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn apply_logical_transactions_replays_schema_refresh_in_mvcc_mode() {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap().to_string();
@@ -3655,6 +4302,58 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(state_after, (1, Some(0)));
+
+                Result::Ok(())
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn update_last_change_id_handles_existing_sync_table_after_mvcc_reset() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap().to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(io.clone(), &db_path).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute(TURSO_SYNC_CREATE_TABLE).unwrap();
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            let conn = conn.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+
+                conn.wal_insert_begin().unwrap();
+                conn.start_nested();
+                conn.reset_main_mvcc_tx_for_wal_session();
+                update_last_change_id(&coro, &conn, "client-a", 2, 7)
+                    .await
+                    .unwrap();
+
+                assert!(conn.has_main_mvcc_tx_for_wal_session());
+                conn.commit_main_mvcc_tx_for_wal_session().unwrap();
+                conn.end_nested();
+                conn.wal_insert_end(true).unwrap();
+
+                let verify = turso_core::Database::open_file(io.clone(), &db_path)
+                    .unwrap()
+                    .connect()
+                    .unwrap();
+                let state_after = read_last_change_id(&coro, &verify, "client-a")
+                    .await
+                    .unwrap();
+                assert_eq!(state_after, (2, Some(7)));
 
                 Result::Ok(())
             }

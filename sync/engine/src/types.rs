@@ -5,9 +5,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    database_sync_operations::MutexSlot, errors::Error, server_proto::LogicalTxnData, Result,
-};
+use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
 
 pub struct Coro<Ctx> {
     pub ctx: Mutex<Ctx>,
@@ -74,16 +72,23 @@ pub struct DbSyncStatus {
     pub max_frame_no: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbChangesStreamKind {
+    Pages,
+    Logical,
+    ReplaceBasePages,
+}
+
 pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
-    pub logical_txns: Option<Vec<LogicalTxnData>>,
+    pub stream_kind: DbChangesStreamKind,
 }
 
 impl DbChangesStatus {
     pub fn is_empty(&self) -> bool {
-        self.file_slot.is_none() && self.logical_txns.is_none()
+        self.file_slot.is_none()
     }
 }
 
@@ -93,10 +98,7 @@ impl std::fmt::Debug for DbChangesStatus {
             .field("time", &self.time)
             .field("revision", &self.revision)
             .field("file_slot.is_some()", &self.file_slot.is_some())
-            .field(
-                "logical_txns.len()",
-                &self.logical_txns.as_ref().map(std::vec::Vec::len),
-            )
+            .field("stream_kind", &self.stream_kind)
             .finish()
     }
 }
@@ -155,6 +157,7 @@ pub struct DatabaseSavedConfiguration {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DatabasePullRevision {
+    // Kept for compatibility with servers that only expose the pre-V1 WAL page protocol.
     Legacy {
         generation: u64,
         synced_frame_no: Option<u64>,
@@ -419,8 +422,16 @@ impl DatabaseChange {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_txn_id = get_core_value_i64_or_null(row, 2)?;
-        let change_type = get_core_value_i64(row, 3)?;
-        let change_type = parse_change_type(change_type)?;
+        let change_type = match get_core_value_i64_or_null(row, 3)? {
+            Some(change_type) => parse_change_type(change_type)?,
+            None if is_null_cdc_v2_commit_payload(row) => DatabaseChangeType::Commit,
+            None => {
+                return Err(Error::DatabaseTapeError(
+                    "column 3 type mismatch: expected integer for non-COMMIT CDC row, got NULL"
+                        .to_string(),
+                ))
+            }
+        };
         // COMMIT records have NULL for table_name and id
         let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
         let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
@@ -446,6 +457,10 @@ impl DatabaseChange {
             turso_core::CdcVersion::V1 => Self::from_row_v1(row),
         }
     }
+}
+
+fn is_null_cdc_v2_commit_payload(row: &turso_core::Row) -> bool {
+    (4..=8).all(|index| matches!(row.get_value(index), turso_core::Value::Null))
 }
 
 pub struct DatabaseRowMutation {
@@ -518,6 +533,8 @@ pub enum DatabaseSchemaReplay {
         name: String,
     },
     Refresh {
+        kind: DatabaseSchemaKind,
+        name: String,
         sql: String,
     },
     Alter {

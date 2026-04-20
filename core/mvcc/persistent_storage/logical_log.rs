@@ -219,7 +219,7 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
 use crate::{
-    io::ReadComplete,
+    io::{CompletionGroup, ReadComplete},
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{
         read_varint, read_varint_partial, varint_len, write_varint_to_vec, DatabaseHeader,
@@ -840,6 +840,39 @@ impl LogicalLog {
         self.offset = 0;
         Ok(c)
     }
+
+    /// Reset the log to a header-only file and return one completion for the
+    /// header write plus truncate.
+    ///
+    /// This intentionally truncates to `LOG_HDR_SIZE`, not zero, so the header
+    /// write and truncate can run as a group without an ordering dependency.
+    /// Either completion order leaves a header-sized file with the fresh header
+    /// bytes at offset zero.
+    pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
+        // Regenerate salt so stale frames from before the reset cannot validate
+        // against this new CRC chain.
+        let mut header = self.current_or_new_header()?;
+        header.salt = self.io.generate_random_number() as u64;
+        self.running_crc = derive_initial_crc(header.salt);
+        self.pending_running_crc = None;
+        self.header = Some(header.clone());
+
+        let header_c = self.write_header(header)?;
+        let truncate_c = self.file.truncate(
+            LOG_HDR_SIZE as u64,
+            Completion::new_trunc(move |result| {
+                if let Err(err) = result {
+                    tracing::error!("logical_log_truncate failed: {}", err);
+                }
+            }),
+        )?;
+        self.offset = 0;
+
+        let mut group = CompletionGroup::new(|_| {});
+        group.add(&header_c);
+        group.add(&truncate_c);
+        Ok(group.build())
+    }
 }
 
 /// Serialize one op into `buffer`.
@@ -1204,6 +1237,10 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset
     }
 
+    pub fn has_pending_ops(&self) -> bool {
+        !self.pending_ops.is_empty()
+    }
+
     /// Returns the running CRC state after all validated frames. Used during recovery
     /// to hand off the chain state to the writer so it can continue appending.
     pub fn running_crc(&self) -> u32 {
@@ -1267,6 +1304,7 @@ impl StreamingLogicalLogReader {
         io: &Arc<dyn crate::IO>,
         mut get_index_info: impl FnMut(MVTableId) -> Result<Arc<IndexInfo>>,
     ) -> Result<StreamingResult> {
+        self.file_size = self.file.size()? as usize;
         if let Some(op) = self.pending_ops.pop_front() {
             return self.parsed_op_to_streaming(op, &mut get_index_info);
         }
