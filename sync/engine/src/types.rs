@@ -73,20 +73,30 @@ pub struct DbSyncStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Transport and apply semantics for a pull-updates response body.
 pub enum DbChangesStreamKind {
+    /// Incremental WAL page frames.
     Pages,
+    /// Decoded MVCC logical transactions.
     Logical,
+    /// Full base-database page snapshot that replaces the client's local base.
     ReplaceBasePages,
 }
 
+/// Remote changes staged by `wait_changes_from_remote` and consumed by apply.
 pub struct DbChangesStatus {
+    /// Client wall-clock time when the response was received.
     pub time: turso_core::WallClockInstant,
+    /// Server revision that the client should persist after a successful apply.
     pub revision: DatabasePullRevision,
+    /// Temporary file containing the streamed response body, if the response was non-empty.
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    /// How `file_slot` should be interpreted by the apply path.
     pub stream_kind: DbChangesStreamKind,
 }
 
 impl DbChangesStatus {
+    /// Returns true when the server reported no new changes.
     pub fn is_empty(&self) -> bool {
         self.file_slot.is_none()
     }
@@ -517,36 +527,57 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 /// by consuming events from [crate::database_tape::DatabaseChangesIterator]
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {
+    /// Replay one SQL statement with bound values.
     StmtReplay(DatabaseStatementReplay),
+    /// Replay a schema operation with idempotence rules suitable for sync.
     SchemaReplay(DatabaseSchemaReplay),
+    /// Replay one row-level CDC mutation.
     RowChange(DatabaseTapeRowChange),
+    /// Commit the current replay transaction.
     Commit,
 }
 
 #[derive(Debug)]
+/// Schema operation emitted by logical MVCC sync or CDC schema replay.
 pub enum DatabaseSchemaReplay {
+    /// Create the schema object if it is not already present.
     Create {
+        /// CREATE statement to execute.
         sql: String,
     },
+    /// Drop the named schema object.
     Drop {
+        /// Kind of object to drop.
         kind: DatabaseSchemaKind,
+        /// Object name to drop.
         name: String,
     },
+    /// Replace the schema object by dropping and recreating it from SQL.
     Refresh {
+        /// Kind of object to refresh.
         kind: DatabaseSchemaKind,
+        /// Object name to refresh.
         name: String,
+        /// CREATE statement for the replacement object.
         sql: String,
     },
+    /// Replay an ALTER statement exactly as supplied.
     Alter {
+        /// ALTER statement to execute.
         sql: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Schema object kind used by schema replay operations.
 pub enum DatabaseSchemaKind {
+    /// Table object.
     Table,
+    /// Index object.
     Index,
+    /// Trigger object.
     Trigger,
+    /// View object.
     View,
 }
 

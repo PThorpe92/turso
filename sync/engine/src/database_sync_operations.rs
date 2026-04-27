@@ -77,6 +77,12 @@ fn ensure_page_stream(header: &PullUpdatesRespProtoBody, context: &str) -> Resul
     }
 }
 
+/// Converts one decoded MVCC logical operation into the tape operation(s) used
+/// by the existing local replay engine.
+///
+/// The server sends row records in SQLite record format and schema/header
+/// changes as structured logical operations. This adapter keeps the apply path
+/// shared with CDC replay instead of adding a second SQL execution pipeline.
 fn logical_op_to_tape_operations(
     op: LogicalOp,
     commit_ts: u64,
@@ -219,6 +225,11 @@ fn logical_op_to_tape_operations(
     }
 }
 
+/// Returns true for user-visible objects that should be replayed on the client.
+///
+/// Logical MVCC streams may include schema or row changes for sync metadata,
+/// CDC, or SQLite-managed tables. Those tables are local implementation state,
+/// so replaying them would either duplicate metadata or make CDC capture itself.
 fn is_logically_replayable_table(name: &str) -> bool {
     !name.starts_with(SQLITE_INTERNAL_PREFIX)
         && !name.starts_with(TURSO_INTERNAL_PREFIX)
@@ -227,6 +238,7 @@ fn is_logically_replayable_table(name: &str) -> bool {
         && name != TURSO_CDC_VERSION_TABLE_NAME
 }
 
+/// Maps the protobuf schema-kind enum into the tape replay enum.
 fn logical_schema_kind(kind: i32) -> Result<DatabaseSchemaKind> {
     let kind = LogicalSchemaKind::try_from(kind).map_err(|_| {
         Error::DatabaseSyncEngineError(format!("unknown logical schema kind: {kind}"))
@@ -243,6 +255,10 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Converts all operations in one logical MVCC transaction to tape operations.
+///
+/// Internal sync/CDC/SQLite objects are filtered out here so both in-memory and
+/// file-backed logical replay use the same user-data boundary.
 pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<DatabaseTapeOperation>> {
     let mut operations = Vec::new();
     for op in txn.ops.iter().cloned() {
@@ -265,6 +281,12 @@ pub fn logical_txn_to_tape_operations(txn: &LogicalTxnData) -> Result<Vec<Databa
     Ok(operations)
 }
 
+/// Replays logical transactions through an existing replay session.
+///
+/// When `commit_at_end` is true, all supplied transactions are committed as one
+/// local transaction after their operations are replayed. Replace-base uses
+/// `false` because it wraps remote logical replay and local CDC replay in a
+/// larger transaction that it commits only after all phases succeed.
 async fn replay_logical_transactions<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
@@ -282,6 +304,10 @@ async fn replay_logical_transactions<Ctx>(
     Ok(())
 }
 
+/// Extracts one length-delimited protobuf message from an in-memory buffer.
+///
+/// Returns `Ok(None)` when the buffer contains only a partial message, allowing
+/// callers to append another file/network chunk before trying again.
 fn take_proto_message_from_bytes<T: prost::Message + Default>(
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
@@ -300,6 +326,10 @@ fn take_proto_message_from_bytes<T: prost::Message + Default>(
     Ok(Some(message))
 }
 
+/// Reads another chunk from a logical transaction file into `bytes`.
+///
+/// The caller owns message framing; this helper only advances the file offset
+/// and treats EOF in the middle of a pending protobuf message as corruption.
 async fn read_proto_file_chunk<Ctx>(
     coro: &Coro<Ctx>,
     file: &Arc<dyn turso_core::File>,
@@ -343,6 +373,11 @@ async fn read_proto_file_chunk<Ctx>(
     Ok(())
 }
 
+/// Replays length-delimited [`LogicalTxnData`] messages from a temporary file.
+///
+/// This is used for large pull-update streams so the client does not need to
+/// keep the whole logical response body in memory. The optional final commit
+/// follows the same contract as `replay_logical_transactions`.
 pub async fn replay_logical_transactions_from_file<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
@@ -376,6 +411,7 @@ pub async fn replay_logical_transactions_from_file<Ctx>(
     Ok(())
 }
 
+/// Applies decoded logical MVCC transactions and commits the replay session.
 pub async fn apply_logical_transactions<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
@@ -384,6 +420,9 @@ pub async fn apply_logical_transactions<Ctx>(
     replay_logical_transactions(coro, replay, txns, true).await
 }
 
+/// Applies decoded logical MVCC transactions without committing the session.
+///
+/// Callers use this when logical replay is one phase of a larger transaction.
 pub async fn apply_logical_transactions_without_commit<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
@@ -392,6 +431,7 @@ pub async fn apply_logical_transactions_without_commit<Ctx>(
     replay_logical_transactions(coro, replay, txns, false).await
 }
 
+/// Applies file-backed logical MVCC transactions and commits the replay session.
 pub async fn apply_logical_transactions_file<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,
@@ -400,6 +440,10 @@ pub async fn apply_logical_transactions_file<Ctx>(
     replay_logical_transactions_from_file(coro, replay, txns_file, true).await
 }
 
+/// Applies file-backed logical MVCC transactions without committing the session.
+///
+/// Replace-base uses this form before local CDC replay so both phases succeed
+/// or roll back together.
 pub async fn apply_logical_transactions_file_without_commit<Ctx>(
     coro: &Coro<Ctx>,
     replay: &mut DatabaseReplaySession,

@@ -115,6 +115,9 @@ fn force_reparse_schema_with_retry(connection: &Arc<turso_core::Connection>) -> 
     for attempt in 0..=2 {
         match connection.force_reparse_schema() {
             Ok(()) => return Ok(()),
+            // CDC setup often runs immediately after schema-changing replay.
+            // A bounded retry lets the connection cross one stale schema-cookie
+            // boundary without masking persistent schema refresh failures.
             Err(LimboError::SchemaUpdated) if attempt < 2 => continue,
             Err(error) => return Err(error.into()),
         }
@@ -123,6 +126,8 @@ fn force_reparse_schema_with_retry(connection: &Arc<turso_core::Connection>) -> 
 }
 
 impl DatabaseTape {
+    /// Creates a tape wrapper that enables CDC with the default table and mode
+    /// on every tracked connection.
     pub fn new(database: Arc<turso_core::Database>) -> Self {
         let opts = DatabaseTapeOpts {
             cdc_table: None,
@@ -131,6 +136,12 @@ impl DatabaseTape {
         };
         Self::new_with_opts(database, opts)
     }
+
+    /// Creates a tape wrapper with explicit CDC and checkpoint options.
+    ///
+    /// Connections opened through [`DatabaseTape::connect`] initialize the CDC
+    /// pragma and cache the negotiated CDC schema version. Connections opened
+    /// with `connect_untracked` skip CDC setup for internal replay work.
     pub fn new_with_opts(database: Arc<turso_core::Database>, opts: DatabaseTapeOpts) -> Self {
         tracing::debug!("create local sync database with options {:?}", opts);
         let cdc_table_name = opts.cdc_table.unwrap_or(DEFAULT_CDC_TABLE_NAME.to_string());
@@ -144,6 +155,11 @@ impl DatabaseTape {
             disable_auto_checkpoint: opts.disable_auto_checkpoint,
         }
     }
+
+    /// Opens a connection without enabling CDC capture.
+    ///
+    /// Replay paths use untracked connections so applying remote or local CDC
+    /// records does not generate another layer of CDC rows.
     pub(crate) fn connect_untracked(&self) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
         if self.disable_auto_checkpoint {
@@ -151,6 +167,12 @@ impl DatabaseTape {
         }
         Ok(connection)
     }
+
+    /// Opens a tracked connection and enables CDC capture for local changes.
+    ///
+    /// The CDC pragma may create tables or observe a schema cookie change. The
+    /// prepare/step retry loop handles the transient `SchemaUpdated` result so
+    /// a newly restored or schema-replayed database can still start tracking.
     pub async fn connect<Ctx>(&self, coro: &Coro<Ctx>) -> Result<Arc<turso_core::Connection>> {
         let connection = self.inner.connect()?;
         if self.disable_auto_checkpoint {
@@ -209,6 +231,10 @@ impl DatabaseTape {
         Ok(connection)
     }
 
+    /// Reads the CDC table format version negotiated by the CDC pragma.
+    ///
+    /// Sync uses this to interpret v1 streams without commit records and v2
+    /// streams that group changes by transaction.
     async fn read_cdc_version<Ctx>(
         coro: &Coro<Ctx>,
         connection: &Arc<turso_core::Connection>,
