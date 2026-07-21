@@ -219,8 +219,11 @@ function runCommand(
 export function findSqlancerDatabases(sqlancerDir: string): string[] {
 	const databases: { path: string; mtime: number }[] = [];
 
-	// Check common locations where SQLancer creates databases
+	// Check common locations where SQLancer creates databases.
+	// LimboProvider.createDatabase writes to ./databases relative to the
+	// SQLancer working directory, so that comes first.
 	const searchDirs = [
+		path.join(sqlancerDir, "databases"),
 		path.join(sqlancerDir, "logs", "limbo"),
 		path.join(sqlancerDir, "logs"),
 		sqlancerDir,

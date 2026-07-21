@@ -78,7 +78,16 @@ public class LimboProvider extends SQLProviderAdapter<SQLite3GlobalState, SQLite
             "cannot start a transaction within a transaction",
             "INDEXED BY",
             "NOT INDEXED",
-            "UNIQUE constraint failed"
+            // Turso reports constraint violations in SQLite's message format
+            // ("<KIND> constraint failed: ..."), not the Xerial JDBC format
+            // ("[SQLITE_CONSTRAINT_*]") that SQLite3Errors expects. SQLancer
+            // intentionally generates constraint-violating statements, so all
+            // of these are expected during database generation.
+            "UNIQUE constraint failed",
+            "NOT NULL constraint failed",
+            "CHECK constraint failed",
+            "FOREIGN KEY constraint failed",
+            "PRIMARY KEY constraint failed"
     );
 
     public LimboProvider() {

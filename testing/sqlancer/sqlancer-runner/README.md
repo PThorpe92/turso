@@ -48,7 +48,8 @@ Environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TIME_LIMIT_MINUTES` | 240 | Total run time (4 hours) |
-| `PER_RUN_TIMEOUT_SECONDS` | 300 | Timeout per SQLancer run |
+| `PER_RUN_TIMEOUT_SECONDS` | 600 | SQLancer time limit per run (watchdog kills at this + 120s grace) |
+| `SQLANCER_COMMIT` | pinned SHA | Upstream SQLancer commit to build (see docker-entrypoint.sqlancer.ts) |
 | `SLEEP_BETWEEN_RUNS_SECONDS` | 5 | Sleep between runs |
 | `LOG_TO_STDOUT` | false | Log SQLancer output to stdout |
 | `GIT_HASH` | unknown | Git commit hash for issue tracking |

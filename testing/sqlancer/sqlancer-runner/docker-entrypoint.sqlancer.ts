@@ -29,6 +29,10 @@ const GIT_HASH = process.env.GIT_HASH || "unknown";
 
 // SQLancer configuration
 const SQLANCER_DIR = "/tmp/sqlancer-limbo";
+// Pin SQLancer to a known-good commit so weekly runs are reproducible and
+// upstream changes can't silently break the Limbo provider patches.
+// Verified against upstream master on 2026-07-20.
+const SQLANCER_COMMIT = process.env.SQLANCER_COMMIT || "0ec985e61ac1bcf8b3f0db522876914b36d07fc0";
 const LIMBO_JAR = process.env.LIMBO_JAR || "/app/turso.jar";
 const NATIVE_LIB_DIR = process.env.NATIVE_LIB_DIR || "/app/native";
 const ANALYSIS_DIR = "/tmp/corruption-analysis";
@@ -213,7 +217,11 @@ async function runSqlancer(
 		});
 	});
 
-	const timeoutPromise = createTimeout(timeoutSeconds, runNumber);
+	// SQLancer itself runs for --timeout-seconds and then exits cleanly. The
+	// watchdog must fire later than that, or clean runs get SIGKILLed mid-shutdown
+	// and misreported as timeout failures. Grace covers JVM startup + shutdown.
+	const WATCHDOG_GRACE_SECONDS = 120;
+	const timeoutPromise = createTimeout(timeoutSeconds + WATCHDOG_GRACE_SECONDS, runNumber);
 
 	try {
 		const result = await Promise.race([runPromise, timeoutPromise]);
@@ -248,8 +256,8 @@ async function runSqlancer(
 				type: "timeout",
 				oracle,
 				output: stdout + stderr,
-				errorSummary: `Timeout after ${timeoutSeconds}s`,
-				timeoutSeconds,
+				errorSummary: `Timeout after ${timeoutSeconds + WATCHDOG_GRACE_SECONDS}s (SQLancer time limit: ${timeoutSeconds}s)`,
+				timeoutSeconds: timeoutSeconds + WATCHDOG_GRACE_SECONDS,
 				seed,
 			};
 
@@ -276,9 +284,9 @@ async function setupSqlancer(): Promise<void> {
 		}
 	}
 
-	// Clone SQLancer
+	// Clone SQLancer at the pinned commit
 	if (!fs.existsSync(SQLANCER_DIR)) {
-		console.log("Cloning SQLancer...");
+		console.log(`Cloning SQLancer at ${SQLANCER_COMMIT}...`);
 		await runCommandSync("git", [
 			"clone",
 			"--depth",
@@ -286,6 +294,8 @@ async function setupSqlancer(): Promise<void> {
 			"https://github.com/sqlancer/sqlancer.git",
 			SQLANCER_DIR,
 		]);
+		await runCommandSync("git", ["fetch", "--depth", "1", "origin", SQLANCER_COMMIT], { cwd: SQLANCER_DIR });
+		await runCommandSync("git", ["checkout", SQLANCER_COMMIT], { cwd: SQLANCER_DIR });
 	}
 
 	// Copy Limbo provider

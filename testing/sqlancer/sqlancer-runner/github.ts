@@ -45,14 +45,20 @@ export class GithubClient {
 	}
 
 	private async getOpenIssues(): Promise<{ title: string; number: number }[]> {
+		// Only count SQLancer's own issues toward the cap. The GitHub App also
+		// creates simulator issues, and counting those starves SQLancer reporting.
 		const octokit = await this.app!.getInstallationOctokit(this.GITHUB_APP_INSTALLATION_ID);
-		const issues = await octokit.request('GET /repos/{owner}/{repo}/issues', {
+		const issues = await octokit.paginate('GET /repos/{owner}/{repo}/issues', {
 			owner: this.GITHUB_ORG,
 			repo: this.GITHUB_REPO_NAME,
 			state: 'open',
 			creator: 'app/turso-github-handyman',
+			labels: 'sqlancer',
+			per_page: 100,
 		});
-		return issues.data.map((issue) => ({ title: issue.title, number: issue.number }));
+		return issues
+			.filter((issue) => !issue.pull_request)
+			.map((issue) => ({ title: issue.title, number: issue.number }));
 	}
 
 	async initialize(): Promise<void> {
@@ -123,8 +129,18 @@ export class GithubClient {
 		}
 
 		if (this.openIssues.length >= MAX_OPEN_SQLANCER_ISSUES) {
+			// Don't drop failures on the floor: fall back to commenting on the
+			// most recent open SQLancer issue instead of creating a new one.
 			console.log(`Max open SQLancer issues reached: ${MAX_OPEN_SQLANCER_ISSUES}`);
-			console.log(`Would create run issue with title: ${title}`);
+			const fallback = this.openIssues[0];
+			if (fallback) {
+				console.log(`Reporting failures as comments on existing issue #${fallback.number}`);
+				this.currentRunIssueNumber = fallback.number;
+				await this.commentOnIssue(fallback.number, failure);
+				this.failuresReportedThisRun = 1;
+			} else {
+				console.log(`Would create run issue with title: ${title}`);
+			}
 			return;
 		}
 
